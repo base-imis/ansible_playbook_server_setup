@@ -1,0 +1,348 @@
+---
+- name: Set up the shared Nginx container
+  hosts: hardening_target
+  become: true
+  gather_facts: false
+
+  vars:
+    shared_base_path: "/home/innovative"
+    shared_nginx_dir: "{{ shared_base_path }}/shared-nginx"
+    shared_nginx_container: "shared-nginx"
+    shared_nginx_image: "nginx:alpine"
+    shared_npm_container: "nginx-proxy-manager"
+    shared_nginx_compose_file: "{{ shared_nginx_dir }}/docker-compose.yml"
+
+  pre_tasks:
+    - name: Validate shared Nginx input
+      ansible.builtin.assert:
+        that:
+          - shared_base_path.startswith('/')
+          - shared_nginx_dir.startswith('/')
+          - shared_npm_container is match('^[A-Za-z0-9_.-]+$')
+        fail_msg: "One or more shared Nginx values are invalid."
+
+    - name: Check Docker and Docker Compose
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - docker --version
+        - docker compose version
+      changed_when: false
+
+  tasks:
+    # -------------------------------------------------------------------------
+    # Docker networks
+    # -------------------------------------------------------------------------
+    - name: Inspect required Docker networks
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - "{{ item }}"
+      loop:
+        - shared-web
+        - npm-network
+      register: shared_network_checks
+      changed_when: false
+      failed_when: false
+
+    - name: Create missing Docker networks
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - create
+          - --driver
+          - bridge
+          - "{{ item.item }}"
+      loop: "{{ shared_network_checks.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc != 0
+      changed_when: true
+
+    - name: Inspect Nginx Proxy Manager npm-network attachment
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{json (index .NetworkSettings.Networks \"npm-network\")}}' }}"
+          - "{{ shared_npm_container }}"
+      register: shared_npm_network_info
+      changed_when: false
+      failed_when: false
+
+    - name: Connect Nginx Proxy Manager to npm-network when missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - connect
+          - npm-network
+          - "{{ shared_npm_container }}"
+      when: >-
+        shared_npm_network_info.rc != 0
+        or shared_npm_network_info.stdout | trim in ['', 'null', '<no value>']
+      changed_when: true
+
+    # -------------------------------------------------------------------------
+    # Shared Nginx files and duplicate-domain protection
+    # -------------------------------------------------------------------------
+    - name: Create shared Nginx directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ shared_nginx_dir }}/nginx"
+        - "{{ shared_nginx_dir }}/nginx/conf.d"
+
+    - name: Render shared Nginx Docker Compose file
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/07_shared_nginx_docker-compose.yml.j2"
+        dest: "{{ shared_nginx_compose_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Render and validate shared Nginx configuration
+      block:
+        - name: Render main shared Nginx configuration
+          ansible.builtin.template:
+            src: "{{ playbook_dir }}/../templates/08_shared_nginx_nginx.conf.j2"
+            dest: "{{ shared_nginx_dir }}/nginx/nginx.conf"
+            owner: root
+            group: root
+            mode: "0644"
+            backup: true
+          register: shared_main_template
+
+        - name: Validate all shared Nginx configurations in a temporary container
+          ansible.builtin.command:
+            argv:
+              - docker
+              - run
+              - --rm
+              - --network
+              - shared-web
+              - --read-only
+              - --tmpfs
+              - /var/cache/nginx:rw,nosuid,nodev,noexec,size=64m,mode=1777
+              - --tmpfs
+              - /var/run:rw,nosuid,nodev,noexec,size=8m,mode=0755
+              - --tmpfs
+              - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+              - -v
+              - "{{ shared_nginx_dir }}/nginx/conf.d:/etc/nginx/conf.d:ro"
+              - -v
+              - "{{ shared_nginx_dir }}/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"
+              - -v
+              - "{{ shared_base_path }}:/srv/projects:ro"
+              - --entrypoint
+              - nginx
+              - "{{ shared_nginx_image }}"
+              - -t
+          register: shared_nginx_validation
+          changed_when: false
+
+      rescue:
+        - name: Show actual failed task and error
+          ansible.builtin.debug:
+            msg:
+              - "FAILED TASK: {{ ansible_failed_task.name | default('Unknown task') }}"
+              - "MESSAGE: {{ ansible_failed_result.msg | default('No message') }}"
+              - "STDOUT: {{ ansible_failed_result.stdout | default('No stdout') }}"
+              - "STDERR: {{ ansible_failed_result.stderr | default('No stderr') }}"
+              - "RC: {{ ansible_failed_result.rc | default('N/A') }}"
+
+        - name: Restore previous main Nginx configuration
+          ansible.builtin.copy:
+            src: "{{ shared_main_template.backup_file }}"
+            dest: "{{ shared_nginx_dir }}/nginx/nginx.conf"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0644"
+          when:
+            - shared_main_template is defined
+            - shared_main_template.backup_file | default('') | length > 0
+
+        - name: Remove new main Nginx configuration when no backup exists
+          ansible.builtin.file:
+            path: "{{ shared_nginx_dir }}/nginx/nginx.conf"
+            state: absent
+          when:
+            - shared_main_template is defined
+            - shared_main_template.changed | default(false)
+            - shared_main_template.backup_file | default('') | length == 0
+
+        - name: Stop after configuration rendering or validation failure
+          ansible.builtin.fail:
+            msg: >-
+              Shared Nginx configuration rendering or validation failed.
+              Review the first failed task above. Previous configuration files
+              were restored when backups were available.
+
+    # -------------------------------------------------------------------------
+    # Create shared-nginx once; reload it for later projects
+    # -------------------------------------------------------------------------
+    - name: Inspect existing shared-nginx container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ shared_nginx_container }}"
+      register: shared_existing_container
+      changed_when: false
+      failed_when: false
+
+    - name: Create shared-nginx container when missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - -d
+          - --name
+          - "{{ shared_nginx_container }}"
+          - --hostname
+          - "{{ shared_nginx_container }}"
+          - --restart
+          - unless-stopped
+          - --security-opt
+          - no-new-privileges:true
+          - --read-only
+          - --pids-limit
+          - "256"
+          - --memory
+          - "256m"
+          - --cpus
+          - "1.0"
+          - -v
+          - "{{ shared_nginx_dir }}/nginx/conf.d:/etc/nginx/conf.d:ro"
+          - -v
+          - "{{ shared_nginx_dir }}/nginx/nginx.conf:/etc/nginx/nginx.conf:ro"
+          - -v
+          - "{{ shared_base_path }}:/srv/projects:ro"
+          - --tmpfs
+          - /var/cache/nginx:rw,nosuid,nodev,noexec,size=64m,mode=1777
+          - --tmpfs
+          - /var/run:rw,nosuid,nodev,noexec,size=8m,mode=0755
+          - --tmpfs
+          - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+          - --network
+          - shared-web
+          - --entrypoint
+          - nginx
+          - "{{ shared_nginx_image }}"
+          - -g
+          - "daemon off;"
+      when: shared_existing_container.rc != 0
+      register: shared_nginx_create
+      changed_when: true
+
+    - name: Inspect shared-nginx npm-network attachment
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{json (index .NetworkSettings.Networks \"npm-network\")}}' }}"
+          - "{{ shared_nginx_container }}"
+      register: shared_nginx_npm_network
+      changed_when: false
+      failed_when: false
+
+    - name: Connect shared-nginx to npm-network when missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - connect
+          - npm-network
+          - "{{ shared_nginx_container }}"
+      when: >-
+        shared_nginx_npm_network.rc != 0
+        or shared_nginx_npm_network.stdout | trim in ['', 'null', '<no value>']
+      changed_when: true
+
+    - name: Inspect shared-nginx running state
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - -f
+          - "{{ '{{.State.Running}}' }}"
+          - "{{ shared_nginx_container }}"
+      register: shared_nginx_state
+      changed_when: false
+      failed_when: false
+
+    - name: Start shared-nginx when stopped
+      ansible.builtin.command:
+        argv:
+          - docker
+          - start
+          - "{{ shared_nginx_container }}"
+      when:
+        - shared_existing_container.rc == 0
+        - shared_nginx_state.stdout | trim != 'true'
+      changed_when: true
+
+    - name: Wait for shared-nginx to be running
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - -f
+          - "{{ '{{.State.Running}}' }}"
+          - "{{ shared_nginx_container }}"
+      register: shared_nginx_running
+      changed_when: false
+      retries: 20
+      delay: 2
+      until:
+        - shared_nginx_running.rc == 0
+        - shared_nginx_running.stdout | trim == 'true'
+
+    - name: Reload existing shared-nginx after configuration change
+      ansible.builtin.command:
+        argv:
+          - docker
+          - kill
+          - --signal
+          - HUP
+          - "{{ shared_nginx_container }}"
+      when:
+        - shared_existing_container.rc == 0
+        - shared_main_template.changed | default(false)
+      changed_when: true
+
+    - name: Check shared-nginx status
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - -f
+          - "{{ '{{.State.Status}} {{.State.Running}} {{.State.Restarting}} {{.State.Error}}' }}"
+          - "{{ shared_nginx_container }}"
+      register: shared_nginx_status
+      changed_when: false
+
+    - name: Require shared-nginx to remain running
+      ansible.builtin.assert:
+        that:
+          - "'running true false' in (shared_nginx_status.stdout | lower)"
+        fail_msg: >-
+          shared-nginx did not remain running.
+          Run: sudo docker logs shared-nginx --tail=100
+
+    - name: Show shared Nginx setup summary
+      ansible.builtin.debug:
+        msg:
+          - "Shared Nginx Directory: {{ shared_nginx_dir }}"
+          - "Shared Nginx Container: {{ shared_nginx_container }}"
+          - "shared-nginx status: {{ shared_nginx_status.stdout }}"
+          - "Logs: sudo docker logs shared-nginx --tail=100"

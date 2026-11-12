@@ -1,0 +1,52 @@
+---
+# Plain-text input values for playbooks/08_Laravel_webapp_deploy.yml.
+# Replace CHANGE_ME values before use, then encrypt this file with Ansible Vault
+# before storing real passwords, tokens, or authentication keys.
+
+laravel_project_name: base-imis
+laravel_repo: "https://github.com/base-imis/web_app.git"
+laravel_webapp_name_input: "base-imis-web_app"
+laravel_branch: integration-next-release
+laravel_domain: "test-baseimis.innovativesolution.com.np"
+
+laravel_use_db_input: "yes"
+laravel_use_geoserver_input: "yes"
+laravel_pii_setup_input: "yes"
+laravel_empty_database_input: "no"
+laravel_pii_db_backup_required_input: "no"
+laravel_npm_setup_input: "yes"
+
+laravel_base_path: "/home/innovative"
+laravel_template_repo: "https://github.com/InSol-2021/imis-base-docker.git"
+laravel_template_branch: php-update
+laravel_proceed_existing_input: "yes"
+laravel_db_type: local
+laravel_pg_network: postgres14_backend
+laravel_shared_web_network: shared-web
+laravel_php_version: "8.2.35"
+
+laravel_db_host: postgres14
+laravel_db_port: "5432"
+laravel_db_name: defaultdb
+laravel_db_user: innovative
+
+laravel_geoserver_domain: "test-geoserver.innovativesolution.com.np"
+laravel_geoserver_workspace: base_imis
+
+laravel_app_name: Base-IMIS
+laravel_app_env: production
+laravel_app_debug: "true"
+
+# Optional semicolon-separated application environment entries.
+# Leave empty to skip these values. Enable the example only when required.
+laravel_extra_env: ""
+# laravel_extra_env: >-
+#   GEOSERVER_INTERNAL_URL=http://geoserver:8080/geoserver;
+#   GEOSERVER_AUTH_KEY=CHANGE_ME_AUTH_KEY
+
+
+# Optional super-admin seed values. Leave blank to skip seeding this account.
+laravel_seed_super_admin_name: ""
+laravel_seed_super_admin_username: ""
+laravel_seed_super_admin_email: ""
+laravel_seed_super_admin_password: ""

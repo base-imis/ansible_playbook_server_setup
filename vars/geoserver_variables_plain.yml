@@ -1,0 +1,37 @@
+---
+# Plain-text input values for 06_install_hardened_geoserver.yml.
+# Encrypt this file with Ansible Vault before storing real passwords.
+
+gs_dir: "/home/{{ ansible_user_id }}/geo"
+gs_printing_setup_input: "yes"
+gs_printing_a4_template_src: "/home/{{ ansible_user_id }}/A4_Landscape.pdf"
+gs_printing_a3_template_src: "/home/{{ ansible_user_id }}/A3_Landscape.pdf"
+gs_version: "2.28.2"
+gs_container_name: geo
+gs_image_name_input: "custom-geo:2.28.2"
+gs_host_port: "18081"
+gs_npm_container: nginx-proxy-manager
+gs_admin_allowed_ips: ""
+gs_domain: test-geoserver.innovativesolution.com.np
+gs_workspace: ""
+gs_cors_origins: "http://127.0.0.1:8000"
+gs_skip_demo_data_input: "yes"
+gs_install_extensions_input: "yes"
+gs_extensions: "authkey,css,printing,querylayer"
+gs_remove_gt_complex: "no"
+gs_run_uid: "1002"
+gs_run_gid: "1002"
+gs_manage_admin_credentials_input: "yes"
+gs_admin_user: admin
+gs_admin_password: "CHANGE_ME_ADMIN_PASSWORD"
+gs_security_setup_input: "yes"
+gs_service_user_input: geoserver_service_user
+gs_service_password_input: "CHANGE_ME_SERVICE_PASSWORD"
+gs_service_role_input: ROLE_GEOSERVER_SERVICE
+gs_db_network: postgres14_backend
+gs_memory_limit: 2g
+gs_memory_reservation: 512m
+gs_jvm_xmx: 1536m
+gs_cpu_limit: "2.0"
+gs_backup_data_input: "yes"
+gs_pause_input: "yes"
