@@ -1,0 +1,16 @@
+FROM tomcat:9-jdk17-temurin-jammy
+ARG REMOVE_GT_COMPLEX={{ gs_remove_gt_complex }}
+RUN apt-get update && apt-get install -y --no-install-recommends curl unzip zip && rm -rf /var/lib/apt/lists/*
+RUN groupadd -g 1002 -r geoserver && useradd -u 1002 -r -g geoserver -s /usr/sbin/nologin geoserver
+RUN rm -rf /usr/local/tomcat/webapps/ROOT /usr/local/tomcat/webapps/docs /usr/local/tomcat/webapps/examples /usr/local/tomcat/webapps/manager /usr/local/tomcat/webapps/host-manager
+RUN cd /usr/local/tomcat/lib && jar xf catalina.jar org/apache/catalina/util/ServerInfo.properties && sed -i 's/server.info=.*/server.info=Apache/' org/apache/catalina/util/ServerInfo.properties && sed -i 's/server.number=.*/server.number=/' org/apache/catalina/util/ServerInfo.properties && sed -i 's/server.built=.*/server.built=/' org/apache/catalina/util/ServerInfo.properties && jar uf catalina.jar org/apache/catalina/util/ServerInfo.properties && rm -rf org
+COPY build/geoserver.war /tmp/geoserver.war
+RUN mkdir -p /usr/local/tomcat/webapps/geoserver && unzip -q /tmp/geoserver.war -d /usr/local/tomcat/webapps/geoserver && rm -f /tmp/geoserver.war
+COPY build/extensions/ /tmp/extensions/
+RUN if [ -d /tmp/extensions ] && find /tmp/extensions -type f -name '*.jar' | grep -q .; then cp -f /tmp/extensions/*.jar /usr/local/tomcat/webapps/geoserver/WEB-INF/lib/; fi && rm -rf /tmp/extensions
+RUN if [ "$REMOVE_GT_COMPLEX" = "yes" ]; then rm -f /usr/local/tomcat/webapps/geoserver/WEB-INF/lib/gt-complex-*.jar; fi
+ENV GEOSERVER_DATA_DIR=/opt/geoserver_data
+RUN mkdir -p /opt/geoserver_data /usr/local/tomcat/logs /usr/local/tomcat/temp /usr/local/tomcat/work && chown -R geoserver:geoserver /opt/geoserver_data /usr/local/tomcat && chmod -R 750 /usr/local/tomcat/conf && chmod -R 750 /usr/local/tomcat/webapps/geoserver/WEB-INF
+USER geoserver
+EXPOSE 8080
+HEALTHCHECK --interval=60s --timeout=10s --retries=5 CMD curl -fsS http://127.0.0.1:8080/geoserver/web/ >/dev/null || exit 1

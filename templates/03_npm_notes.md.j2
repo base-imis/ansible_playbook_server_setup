@@ -1,0 +1,19 @@
+# Nginx Proxy Manager - Hardened Install Notes
+
+## Admin access
+Port 81 is bound to localhost only. From your local machine:
+
+    ssh -p {{ npm_ssh_port }} -N -L 8181:127.0.0.1:81 {{ npm_admin_user }}@{{ ansible_host }}
+
+Open http://127.0.0.1:8181.
+
+Default login: admin@example.com / changeme
+
+Change the default password immediately.
+
+## Useful commands
+
+    cd {{ npm_dir }}
+    docker compose ps
+    docker compose logs -f
+    docker inspect --format='{% raw %}{{.State.Health.Status}}{% endraw %}' nginx-proxy-manager

@@ -445,7 +445,7 @@
         msg:
           - "NPM is listening publicly on ports 80 and 443."
           - "The admin interface is bound to 127.0.0.1 on port 81."
-          - "Tunnel: ssh -p {{ npm_ssh_port }} -N -L 8181:127.0.0.1:81 {{ npm_admin_user }}@<server_ip>"
+          - "Tunnel: ssh -p {{ npm_ssh_port }} -N -L 8181:127.0.0.1:81 {{ npm_admin_user }}@{{ ansible_host }}"
           - "Open http://127.0.0.1:8181 and immediately change the initial administrator credentials."
 
   handlers:

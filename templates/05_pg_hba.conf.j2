@@ -1,0 +1,22 @@
+# Managed by Ansible: playbooks/05_install_postgres_hardened.yml
+
+# Local/container administration uses SCRAM authentication.
+local   all             all                                     scram-sha-256
+host    all             all             127.0.0.1/32            scram-sha-256
+host    all             all             ::1/128                 scram-sha-256
+
+# PostgreSQL administration. Application database/user access is managed by
+# 051_postgres_helper.yml.
+{% if pg_allow_docker_bridge_access %}
+host    all                              {{ pg_admin_user }}    {{ pg_docker_bridge_cidr }}   scram-sha-256
+{% endif %}
+
+# Optional public/admin client allowlist.
+{% for ip in pg_public_allowed_list %}
+host    all                              {{ pg_admin_user }}    {{ ip if '/' in ip else ip + '/32' }}    scram-sha-256
+{% endfor %}
+
+# Optional private/internal client allowlist.
+{% for ip in pg_private_allowed_list %}
+host    all                              {{ pg_admin_user }}    {{ ip if '/' in ip else ip + '/32' }}    scram-sha-256
+{% endfor %}

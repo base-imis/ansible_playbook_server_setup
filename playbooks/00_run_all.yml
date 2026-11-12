@@ -1,0 +1,11 @@
+---
+# Canonical full sequence. Helper playbooks 051 and 061 are intentionally optional.
+# Obsolete duplicate Bash scripts 07_Web_app.sh and 08_shared_nginx.sh are not run here.
+- import_playbook: 01_linux_ssh_setup_harden.yml
+- import_playbook: 02_docker_setup_hardening.yml
+- import_playbook: 03_Nginx_proxy.yml
+- import_playbook: 04_install_fail2ban.yml
+- import_playbook: 05_install_postgres_hardened.yml
+- import_playbook: 06_install_hardened_geoserver.yml
+- import_playbook: 07_shared_nginx_register.yml
+- import_playbook: 08_Laravel_webapp_deploy.yml

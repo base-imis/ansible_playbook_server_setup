@@ -1,0 +1,149 @@
+---
+- name: Install Fail2ban SSH-only hardening
+  hosts: hardening_target
+  become: true
+  gather_facts: true
+
+  vars_prompt:
+    - name: fail2ban_ssh_port_input
+      prompt: "SSH port to protect (leave blank to detect from sshd)"
+      default: ""
+      private: false
+    - name: fail2ban_admin_ip
+      prompt: "Admin/public IP or CIDR to whitelist"
+      private: false
+    - name: fail2ban_extra_ignore_ips
+      prompt: "Additional trusted IPs/CIDRs separated by spaces (optional)"
+      default: ""
+      private: false
+    - name: fail2ban_bantime
+      prompt: "Ban duration"
+      default: "1h"
+      private: false
+    - name: fail2ban_findtime
+      prompt: "Failure counting window"
+      default: "10m"
+      private: false
+    - name: fail2ban_maxretry
+      prompt: "Maximum failed attempts"
+      default: "5"
+      private: false
+    - name: fail2ban_pause_input
+      prompt: "Pause for final SSH verification? (yes/no)"
+      default: "yes"
+      private: false
+
+  pre_tasks:
+    - name: Detect effective SSH port
+      ansible.builtin.shell: "/usr/sbin/sshd -T 2>/dev/null | awk '/^port / {print $2; exit}'"
+      args:
+        executable: /bin/bash
+      register: fail2ban_detected_port
+      changed_when: false
+
+    - name: Set Fail2ban runtime values
+      ansible.builtin.set_fact:
+        fail2ban_ssh_port: "{{ (fail2ban_ssh_port_input | trim) if (fail2ban_ssh_port_input | trim | length > 0) else (fail2ban_detected_port.stdout | trim | default('22', true)) }}"
+        fail2ban_pause: "{{ fail2ban_pause_input | lower in ['yes', 'y', 'true', '1'] }}"
+
+    - name: Validate Fail2ban inputs
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == 'Debian'
+          - fail2ban_ssh_port | int >= 1
+          - fail2ban_ssh_port | int <= 65535
+          - fail2ban_admin_ip is match('^[0-9]{1,3}(\\.[0-9]{1,3}){3}(/[0-9]{1,2})?$')
+          - fail2ban_maxretry | int >= 1
+          - fail2ban_pause_input | lower in ['yes', 'y', 'true', '1', 'no', 'n', 'false', '0']
+
+  tasks:
+    - name: Install Fail2ban prerequisites
+      ansible.builtin.apt:
+        name:
+          - fail2ban
+          - curl
+          - iproute2
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure Fail2ban jail directory exists
+      ansible.builtin.file:
+        path: /etc/fail2ban/jail.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Write SSH-only Fail2ban jail
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/04_fail2ban_ssh.local.j2"
+        dest: /etc/fail2ban/jail.d/00-ssh-hardening.local
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      register: fail2ban_jail_file
+
+    - name: Validate Fail2ban configuration
+      ansible.builtin.command: fail2ban-client -t
+      changed_when: false
+
+    - name: Enable and restart Fail2ban
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        enabled: true
+        state: restarted
+      when: fail2ban_jail_file.changed
+
+    - name: Ensure Fail2ban is started when config was unchanged
+      ansible.builtin.systemd_service:
+        name: fail2ban
+        enabled: true
+        state: started
+      when: not fail2ban_jail_file.changed
+
+    - name: Wait for Fail2ban socket
+      ansible.builtin.command: fail2ban-client ping
+      register: fail2ban_ping
+      retries: 6
+      delay: 2
+      until: "'pong' in fail2ban_ping.stdout | lower"
+      changed_when: false
+
+    - name: Verify sshd jail is active
+      ansible.builtin.command: fail2ban-client status sshd
+      changed_when: false
+
+    - name: Read currently banned SSH IPs
+      ansible.builtin.command: fail2ban-client get sshd banip
+      register: fail2ban_banned_ips
+      changed_when: false
+      failed_when: false
+
+    - name: Unban the trusted admin IP if currently banned
+      ansible.builtin.command:
+        argv: [fail2ban-client, set, sshd, unbanip, "{{ fail2ban_admin_ip.split('/')[0] }}"]
+      when: fail2ban_admin_ip.split('/')[0] in fail2ban_banned_ips.stdout.split()
+      changed_when: true
+
+    - name: Pause for SSH verification
+      ansible.builtin.pause:
+        prompt: >-
+          Open another terminal and verify SSH still works on port {{ fail2ban_ssh_port }}.
+          Type yes to confirm.
+      register: fail2ban_ssh_check
+      when: fail2ban_pause
+
+    - name: Require SSH verification confirmation
+      ansible.builtin.assert:
+        that: fail2ban_ssh_check.user_input | default('yes') | lower == 'yes'
+        fail_msg: "SSH verification was not confirmed. Review Fail2ban immediately."
+      when: fail2ban_pause
+
+    - name: Display Fail2ban summary
+      ansible.builtin.debug:
+        msg:
+          - "Protected SSH port: {{ fail2ban_ssh_port }}"
+          - "Whitelisted: 127.0.0.1/8 ::1 {{ fail2ban_admin_ip }} {{ fail2ban_extra_ignore_ips }}"
+          - "Ban time={{ fail2ban_bantime }}, find time={{ fail2ban_findtime }}, max retry={{ fail2ban_maxretry }}"

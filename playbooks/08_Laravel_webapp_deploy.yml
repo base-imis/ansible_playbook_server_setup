@@ -1385,7 +1385,6 @@
               "COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer",
               composer_copy,
           )
-
           updated = re.sub(
               r'(?m)^ENTRYPOINT\s+\[\s*"composer"\s*\]\s*$\n?',
               "",

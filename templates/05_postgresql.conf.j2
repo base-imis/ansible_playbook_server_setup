@@ -1,0 +1,18 @@
+listen_addresses = '*'
+password_encryption = 'scram-sha-256'
+
+max_connections = {{ pg_max_connections }}
+shared_buffers = {{ pg_shared_buffers }}
+work_mem = {{ pg_work_mem }}
+maintenance_work_mem = {{ pg_maintenance_work_mem }}
+
+log_connections = on
+log_disconnections = on
+log_statement = 'ddl'
+log_min_duration_statement = 1000
+logging_collector = on
+log_directory = '/var/log/postgresql'
+log_filename = 'postgresql-%Y-%m-%d.log'
+log_rotation_age = '1d'
+log_rotation_size = '100MB'
+timezone = 'UTC'
