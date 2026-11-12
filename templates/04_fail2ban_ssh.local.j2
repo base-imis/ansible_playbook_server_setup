@@ -1,0 +1,19 @@
+# Managed by Ansible: 04_install_fail2ban.yml
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1 {{ fail2ban_admin_ip }} {{ fail2ban_extra_ignore_ips }}
+bantime = {{ fail2ban_bantime }}
+findtime = {{ fail2ban_findtime }}
+maxretry = {{ fail2ban_maxretry }}
+backend = systemd
+banaction = iptables-multiport
+banaction_allports = iptables-allports
+
+[sshd]
+enabled = true
+port = {{ fail2ban_ssh_port }}
+filter = sshd
+backend = systemd
+logpath = %(sshd_log)s
+maxretry = {{ fail2ban_maxretry }}
+findtime = {{ fail2ban_findtime }}
+bantime = {{ fail2ban_bantime }}

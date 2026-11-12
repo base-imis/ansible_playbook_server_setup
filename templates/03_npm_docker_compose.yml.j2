@@ -1,0 +1,30 @@
+# Nginx Proxy Manager - hardened compose managed by Ansible
+services:
+  app:
+    image: 'jc21/nginx-proxy-manager:2.16.0'
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+      - '127.0.0.1:81:81'
+    environment:
+      DISABLE_IPV6: 'true'
+      IP_RANGES_FETCH_ENABLED: 'false'
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+    networks:
+      - npm-network
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:81/api/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+networks:
+  npm-network:
+    name: npm-network
+    driver: bridge

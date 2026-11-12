@@ -1,0 +1,1556 @@
+---
+- name: Linux server and SSH hardening - root to innovative using same SSH key
+  hosts: hardening_target
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars:
+    hardening_bool_answers: ["yes", "y", "true", "1", "no", "n", "false", "0"]
+
+    hardening_packages:
+      - iproute2
+      - iptables
+      - unattended-upgrades
+      - libpam-pwquality
+      - auditd
+      - audispd-plugins
+      - aide
+      - aide-common
+      - rsyslog
+
+    hardening_sshd_dropin: /etc/ssh/sshd_config.d/00-ansible-hardening.conf
+    hardening_firewall_script: /usr/local/sbin/ansible-hardening-firewall
+    hardening_firewall_service: /etc/systemd/system/ansible-hardening-firewall.service
+
+  pre_tasks:
+    # ================================================================
+    # HYBRID INPUT MODE
+    #
+    # With Vault:
+    #   ansible-playbook -i inventory.ini 01_linux_ssh_setup_harden_reuse_root_keys.yml \
+    #     -e @vault/hardening_vault.yml --ask-vault-pass
+    #
+    # Without Vault:
+    #   ansible-playbook -i inventory.ini 01_linux_ssh_setup_harden_reuse_root_keys.yml
+    #
+    # Missing vault_* values are prompted.
+    # ================================================================
+
+    - name: Detect local control-node execution
+      ansible.builtin.set_fact:
+        hardening_local_connection: "{{ (ansible_connection | default('ssh')) == 'local' }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Set the initial SSH port prompt default
+      ansible.builtin.set_fact:
+        hardening_initial_port_hint: >-
+          {{ (41447 if hardening_local_connection
+              else (ansible_port | default(41447, true))) | int }}
+      delegate_to: localhost
+      become: false
+
+    - name: Ask for initial SSH private key when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Enter the absolute path to the INITIAL SSH private key on this control
+          server. This key is used to verify the new administrative user's SSH login
+          (press Enter to use /root/.ssh/id_ed25519_ansible)
+      register: prompt_initial_private_key
+      when:
+        - not hardening_local_connection
+        - ansible_ssh_private_key_file is not defined
+        - vault_initial_ssh_private_key is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask for administrative username when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Enter the NEW non-root administrative Linux username to create or use
+          (example: innovative; do not enter root)
+      register: prompt_admin_user
+      when: vault_hardening_admin_user is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask for administrative password when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Enter the password for the NEW administrative user
+          {{ prompt_admin_user.user_input | default('') | trim }}
+          (not the root password; this password will be used for sudo)
+        echo: false
+      register: prompt_admin_password
+      when: vault_hardening_admin_password is not defined
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Ask for root password when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Enter a NEW password for the root account. Leave blank to keep the current
+          root password unchanged. This is different from the administrative-user password.
+        echo: false
+      register: prompt_root_password
+      when: vault_hardening_root_password is not defined
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+    - name: Ask for current SSH port when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Enter the CURRENT SSH port used to access this server
+          (press Enter to use {{ hardening_initial_port_hint }}).
+      register: prompt_initial_ssh_port
+      when: vault_hardening_initial_ssh_port is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask for target SSH port when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Enter the NEW SSH port for the server after hardening (number 1-65535).
+          Press Enter to keep the current port. Do not close your current session.
+      register: prompt_target_ssh_port
+      when: vault_hardening_target_ssh_port is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask for office SSH CIDR when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Enter the office public IPv4 address or CIDR allowed to connect by SSH
+          (example: 203.0.113.25/32; leave blank if not required)
+      register: prompt_office_ssh_cidr
+      when: vault_hardening_office_ssh_cidr is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask for control-server SSH CIDR when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Enter the Ansible control-server public IPv4 address or CIDR allowed to
+          connect by SSH (example: 203.0.113.40/32; leave blank if not required)
+      register: prompt_control_ssh_cidr
+      when: vault_hardening_control_ssh_cidr is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask whether HTTP is allowed when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Allow inbound HTTP port 80 through the host firewall? Enter yes or no.
+          Default: yes
+      register: prompt_allow_http
+      when: vault_hardening_allow_http is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask whether HTTPS is allowed when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Allow inbound HTTPS port 443 through the host firewall? Enter yes or no.
+          Default: yes
+      register: prompt_allow_https
+      when: vault_hardening_allow_https is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask whether root should be locked when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Lock the root account after the new administrative SSH and sudo checks
+          succeed? Enter yes or no. Default: yes
+      register: prompt_lock_root
+      when: vault_hardening_lock_root is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask whether root authorized_keys should be removed when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Delete /root/.ssh/authorized_keys after the new user's key login has been
+          verified? Enter yes or no. Default: yes
+      register: prompt_remove_root_keys
+      when: vault_hardening_remove_root_authorized_keys is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask whether unused users should be locked when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Lock other interactive Linux users with UID 1000 or higher? Enter yes or
+          no. Default: no
+      register: prompt_lock_unused_users
+      when: vault_hardening_lock_unused_users is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask whether remote syslog should be configured when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Send system logs to a remote syslog server? Enter yes or no. Default: no
+      register: prompt_remote_syslog
+      when: vault_hardening_remote_syslog is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask for remote syslog target when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Enter the remote syslog server as HOST:PORT if remote syslog is enabled
+          (example: siem-server.com:514; press Enter for the default)
+      register: prompt_remote_syslog_target
+      when: vault_hardening_remote_syslog_target is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Ask whether safety checkpoints should pause when not supplied
+      ansible.builtin.pause:
+        prompt: >-
+          Pause for confirmation before SSH and root-lock changes? Enter yes or no.
+          Default: yes; yes is recommended for the first run
+      register: prompt_pause
+      when: vault_hardening_pause is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Resolve Vault values or prompted values
+      ansible.builtin.set_fact:
+        hardening_initial_private_key: >-
+          {{ '' if hardening_local_connection else
+             (ansible_ssh_private_key_file
+              if ansible_ssh_private_key_file is defined
+              else (vault_initial_ssh_private_key
+                    if vault_initial_ssh_private_key is defined
+                    else (prompt_initial_private_key.user_input
+                          | default('/root/.ssh/id_ed25519_ansible')
+                          | trim
+                          | default('/root/.ssh/id_ed25519_ansible', true)))) }}
+
+        hardening_admin_user: >-
+          {{ vault_hardening_admin_user
+             if vault_hardening_admin_user is defined
+             else (prompt_admin_user.user_input | default('') | trim) }}
+
+        hardening_admin_password: >-
+          {{ vault_hardening_admin_password
+             if vault_hardening_admin_password is defined
+             else (prompt_admin_password.user_input | default('')) }}
+
+        hardening_root_password: >-
+          {{ vault_hardening_root_password
+             if vault_hardening_root_password is defined
+             else (prompt_root_password.user_input | default('')) }}
+
+        hardening_initial_ssh_port_input: >-
+          {{ vault_hardening_initial_ssh_port
+             if vault_hardening_initial_ssh_port is defined
+             else ((prompt_initial_ssh_port.user_input | default('') | trim)
+                   or (hardening_initial_port_hint | string)) }}
+
+        hardening_target_ssh_port_input: >-
+          {{ vault_hardening_target_ssh_port
+             if vault_hardening_target_ssh_port is defined
+             else (prompt_target_ssh_port.user_input | trim
+                   or (hardening_initial_ssh_port_input | string)) }}
+
+        hardening_office_ssh_cidr: >-
+          {{ vault_hardening_office_ssh_cidr
+             if vault_hardening_office_ssh_cidr is defined
+             else (prompt_office_ssh_cidr.user_input | default('') | trim) }}
+
+        hardening_control_ssh_cidr: >-
+          {{ vault_hardening_control_ssh_cidr
+             if vault_hardening_control_ssh_cidr is defined
+             else (prompt_control_ssh_cidr.user_input | default('') | trim) }}
+
+        hardening_allow_http_input: >-
+          {{ vault_hardening_allow_http
+             if vault_hardening_allow_http is defined
+             else ((prompt_allow_http.user_input | default('') | trim) or 'yes') }}
+
+        hardening_allow_https_input: >-
+          {{ vault_hardening_allow_https
+             if vault_hardening_allow_https is defined
+             else ((prompt_allow_https.user_input | default('') | trim) or 'yes') }}
+
+        hardening_lock_root_input: >-
+          {{ vault_hardening_lock_root
+             if vault_hardening_lock_root is defined
+             else ((prompt_lock_root.user_input | default('') | trim) or 'yes') }}
+
+        hardening_remove_root_authorized_keys_input: >-
+          {{ vault_hardening_remove_root_authorized_keys
+             if vault_hardening_remove_root_authorized_keys is defined
+             else ((prompt_remove_root_keys.user_input | default('') | trim) or 'yes') }}
+
+        hardening_lock_unused_users_input: >-
+          {{ vault_hardening_lock_unused_users
+             if vault_hardening_lock_unused_users is defined
+             else ((prompt_lock_unused_users.user_input | default('') | trim) or 'no') }}
+
+        hardening_remote_syslog_input: >-
+          {{ vault_hardening_remote_syslog
+             if vault_hardening_remote_syslog is defined
+             else ((prompt_remote_syslog.user_input | default('') | trim) or 'no') }}
+
+        hardening_remote_syslog_target: >-
+          {{ vault_hardening_remote_syslog_target
+             if vault_hardening_remote_syslog_target is defined
+             else ((prompt_remote_syslog_target.user_input | default('') | trim) or 'siem-server.com:514') }}
+
+        hardening_pause_input: >-
+          {{ vault_hardening_pause
+             if vault_hardening_pause is defined
+             else ((prompt_pause.user_input | default('') | trim) or 'yes') }}
+      no_log: true
+
+    - name: Detect the current SSH port for local execution
+      ansible.builtin.command:
+        argv: [sshd, -T]
+      register: hardening_current_sshd_config
+      changed_when: false
+      when: hardening_local_connection
+
+    - name: Resolve the detected current SSH port
+      ansible.builtin.set_fact:
+        hardening_detected_ssh_ports: >-
+          {{ hardening_current_sshd_config.stdout_lines
+             | default([])
+             | select('match', '^port [0-9]+$')
+             | map('regex_replace', '^port ', '')
+             | map('int')
+             | list }}
+      when: hardening_local_connection
+
+    - name: Select the current SSH port for local execution
+      ansible.builtin.set_fact:
+        hardening_detected_ssh_port: >-
+          {{ (hardening_detected_ssh_ports
+              | select('equalto', hardening_initial_ssh_port_input | int)
+              | list
+              | first
+              | default(hardening_detected_ssh_ports | first | default(22), true))
+             | int }}
+      when: hardening_local_connection
+
+    - name: Freeze initial connection information
+      ansible.builtin.set_fact:
+        hardening_initial_user: "{{ ansible_user | default('root') }}"
+        hardening_initial_ssh_port: >-
+          {{ (hardening_detected_ssh_port | default(22, true)
+              if hardening_local_connection
+              else (hardening_initial_ssh_port_input | int)) }}
+        hardening_ssh_port: "{{ hardening_target_ssh_port_input | int }}"
+        hardening_port_check_host: "{{ ansible_host | default(inventory_hostname) }}"
+        hardening_allow_http: "{{ hardening_allow_http_input | lower in ['yes', 'y', 'true', '1'] }}"
+        hardening_allow_https: "{{ hardening_allow_https_input | lower in ['yes', 'y', 'true', '1'] }}"
+        hardening_lock_root: "{{ hardening_lock_root_input | lower in ['yes', 'y', 'true', '1'] }}"
+        hardening_remove_root_authorized_keys: "{{ hardening_remove_root_authorized_keys_input | lower in ['yes', 'y', 'true', '1'] }}"
+        hardening_lock_unused_users: "{{ hardening_lock_unused_users_input | lower in ['yes', 'y', 'true', '1'] }}"
+        hardening_remote_syslog: "{{ hardening_remote_syslog_input | lower in ['yes', 'y', 'true', '1'] }}"
+        hardening_pause: "{{ hardening_pause_input | lower in ['yes', 'y', 'true', '1'] }}"
+
+    - name: Build the SSH port transition set
+      ansible.builtin.set_fact:
+        hardening_all_ssh_ports: >-
+          {{ [hardening_initial_ssh_port | int, hardening_ssh_port | int]
+             | unique | list }}
+
+    - name: Validate hardening inputs
+      ansible.builtin.assert:
+        that:
+          - hardening_admin_user is match('^[a-z_][a-z0-9_-]*[$]?$')
+          - hardening_admin_password | length > 0
+          - hardening_initial_ssh_port | int >= 1
+          - hardening_initial_ssh_port | int <= 65535
+          - hardening_initial_ssh_port_input | int >= 1
+          - hardening_initial_ssh_port_input | int <= 65535
+          - hardening_ssh_port | int >= 1
+          - hardening_ssh_port | int <= 65535
+          - hardening_allow_http_input | lower in hardening_bool_answers
+          - hardening_allow_https_input | lower in hardening_bool_answers
+          - hardening_lock_root_input | lower in hardening_bool_answers
+          - hardening_remove_root_authorized_keys_input | lower in hardening_bool_answers
+          - hardening_lock_unused_users_input | lower in hardening_bool_answers
+          - hardening_remote_syslog_input | lower in hardening_bool_answers
+          - hardening_pause_input | lower in hardening_bool_answers
+          - not hardening_lock_root or hardening_pause
+        fail_msg: "Review the Vault values, inventory values, or prompted values."
+      delegate_to: localhost
+      become: false
+
+    # Do not stat /root/.ssh directly as a non-root control user because that
+    # causes an opaque Permission denied failure. test -r gives a clean result.
+    - name: Check whether the initial private key is readable on the control server
+      ansible.builtin.command:
+        argv:
+          - test
+          - -r
+          - "{{ hardening_initial_private_key }}"
+      register: hardening_initial_key_readable
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+      become: false
+      when: not hardening_local_connection
+
+    - name: Require a readable initial private key on the control server
+      ansible.builtin.assert:
+        that:
+          - hardening_initial_private_key | length > 0
+          - hardening_initial_key_readable.rc == 0
+        fail_msg: >-
+          The SSH private key {{ hardening_initial_private_key }} is not readable by
+          the user running ansible-playbook on the control server. Keep the private
+          key on the control server and use a path readable by that control user.
+      delegate_to: localhost
+      become: false
+      when: not hardening_local_connection
+
+    - name: Apply the same private key to the current Ansible connection
+      ansible.builtin.set_fact:
+        ansible_ssh_private_key_file: "{{ hardening_initial_private_key }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
+      when: not hardening_local_connection
+
+    - name: Supply sudo password when inventory already connects as the admin user
+      ansible.builtin.set_fact:
+        ansible_become_password: "{{ hardening_admin_password }}"
+      when: hardening_initial_user == hardening_admin_user
+      no_log: true
+
+    - name: Gather managed-server facts
+      ansible.builtin.setup:
+
+    - name: Require Debian or Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == 'Debian'
+          - ansible_host is defined
+        fail_msg: "This playbook currently supports Debian/Ubuntu managed servers."
+
+  tasks:
+    - name: Install hardening packages
+      ansible.builtin.apt:
+        name: "{{ hardening_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create hardening state directory
+      ansible.builtin.file:
+        path: /var/lib/harden
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Set root password when supplied during root bootstrap
+      ansible.builtin.command: chpasswd
+      args:
+        stdin: "root:{{ hardening_root_password }}"
+      when:
+        - hardening_initial_user == 'root'
+        - hardening_root_password | length > 0
+      no_log: true
+      changed_when: true
+
+    - name: Create or update the non-root administrative user
+      ansible.builtin.user:
+        name: "{{ hardening_admin_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups: sudo
+        append: true
+        state: present
+
+    # The control node and managed node are the same server in the supported
+    # single-server setup. Keep the deployment repository available to the new
+    # administrative user after hardening. If it is already in the new user's
+    # home, preserve and use it instead of moving or overwriting it.
+    - name: Define deployment repository paths
+      ansible.builtin.set_fact:
+        hardening_repo_destination: "/home/{{ hardening_admin_user }}/server-setup-ansible"
+        hardening_repo_initial_source: >-
+          {{ ('/root/server-setup-ansible'
+              if hardening_initial_user == 'root'
+              else '/home/' ~ hardening_initial_user ~ '/server-setup-ansible') }}
+
+    - name: Check deployment repository in new administrative user's home
+      ansible.builtin.stat:
+        path: "{{ hardening_repo_destination }}"
+      register: hardening_repo_destination_status
+
+    - name: Check deployment repository in the initial user's home
+      ansible.builtin.stat:
+        path: "{{ hardening_repo_initial_source }}"
+      register: hardening_repo_initial_source_status
+
+    - name: Create destination for deployment repository copy
+      ansible.builtin.file:
+        path: "{{ hardening_repo_destination }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - not hardening_repo_destination_status.stat.exists
+        - hardening_repo_initial_source_status.stat.exists
+        - hardening_repo_initial_source_status.stat.isdir
+        - hardening_repo_initial_source != hardening_repo_destination
+
+    - name: Copy deployment repository without moving the active working directory
+      ansible.builtin.command:
+        argv:
+          - cp
+          - -a
+          - "{{ hardening_repo_initial_source }}/."
+          - "{{ hardening_repo_destination }}/"
+      when:
+        - not hardening_repo_destination_status.stat.exists
+        - hardening_repo_initial_source_status.stat.exists
+        - hardening_repo_initial_source_status.stat.isdir
+        - hardening_repo_initial_source != hardening_repo_destination
+      changed_when: true
+
+    - name: Ensure deployment repository ownership belongs to the new user
+      ansible.builtin.file:
+        path: "{{ hardening_repo_destination }}"
+        owner: "{{ hardening_admin_user }}"
+        group: "{{ hardening_admin_user }}"
+        recurse: true
+        state: directory
+      when: >-
+        (hardening_repo_destination_status.stat.exists
+         and hardening_repo_destination_status.stat.isdir)
+        or
+        (hardening_repo_initial_source_status.stat.exists
+         and hardening_repo_initial_source_status.stat.isdir
+         and hardening_repo_initial_source != hardening_repo_destination)
+
+    - name: Report deployment repository location
+      ansible.builtin.debug:
+        msg: >-
+          The deployment repository is available at
+          {{ hardening_repo_destination }}. An existing repository in the new
+          user's home was preserved; otherwise it was copied from
+          {{ hardening_repo_initial_source }} when present. The active source
+          directory was not moved during the playbook run.
+
+    - name: Set administrative user password
+      ansible.builtin.command: chpasswd
+      args:
+        stdin: "{{ hardening_admin_user }}:{{ hardening_admin_password }}"
+      no_log: true
+      changed_when: true
+
+    - name: Ensure administrative SSH directory exists
+      ansible.builtin.file:
+        path: "/home/{{ hardening_admin_user }}/.ssh"
+        state: directory
+        owner: "{{ hardening_admin_user }}"
+        group: "{{ hardening_admin_user }}"
+        mode: "0700"
+
+    # ==================================================================
+    # REUSE ROOT AUTHORIZED KEYS
+    #
+    # The SAME private key remains on the control server.
+    # All public-key entries currently authorized for root are copied into
+    # the new admin user's authorized_keys. Existing admin keys are preserved.
+    # Root authorized_keys is deleted only after final admin SSH/sudo tests.
+    # ==================================================================
+
+    - name: Check root authorized_keys during root bootstrap
+      ansible.builtin.stat:
+        path: /root/.ssh/authorized_keys
+      register: hardening_root_authorized_keys_status
+      when: hardening_initial_user == 'root'
+
+    - name: Read all root authorized keys
+      ansible.builtin.slurp:
+        src: /root/.ssh/authorized_keys
+      register: hardening_root_authorized_keys_data
+      when:
+        - hardening_initial_user == 'root'
+        - hardening_root_authorized_keys_status.stat.exists
+        - hardening_root_authorized_keys_status.stat.isreg
+
+    - name: Ask for a public key when root authorized_keys is unavailable or empty
+      ansible.builtin.pause:
+        prompt: >-
+          /root/.ssh/authorized_keys is missing or empty. Paste one complete public
+          SSH key for the NEW administrative user {{ hardening_admin_user }}.
+          Paste the .pub key contents, not the private-key path.
+      register: prompt_admin_public_key
+      when:
+        - hardening_initial_user == 'root'
+        - >-
+          (not hardening_root_authorized_keys_status.stat.exists
+           or not hardening_root_authorized_keys_status.stat.isreg
+           or (hardening_root_authorized_keys_data.content | default('') | b64decode | trim | length) == 0)
+      delegate_to: localhost
+      become: false
+
+    - name: Migrate all root authorized_keys entries to administrative user
+      ansible.builtin.blockinfile:
+        path: "/home/{{ hardening_admin_user }}/.ssh/authorized_keys"
+        create: true
+        owner: "{{ hardening_admin_user }}"
+        group: "{{ hardening_admin_user }}"
+        mode: "0600"
+        marker: "# {mark} ANSIBLE MIGRATED ROOT AUTHORIZED KEYS"
+        block: "{{ hardening_root_authorized_keys_data.content | b64decode | trim }}"
+        backup: true
+      when:
+        - hardening_initial_user == 'root'
+        - hardening_root_authorized_keys_status.stat.exists
+        - hardening_root_authorized_keys_status.stat.isreg
+        - (hardening_root_authorized_keys_data.content | default('') | b64decode | trim | length) > 0
+
+    - name: Require a user-supplied public key when no root key exists
+      ansible.builtin.assert:
+        that:
+          - (prompt_admin_public_key.user_input | default('') | trim) | length > 0
+        fail_msg: >-
+          A public SSH key is required because /root/.ssh/authorized_keys was
+          missing or empty. Run the playbook again and paste a complete public key.
+      when:
+        - hardening_initial_user == 'root'
+        - (not hardening_root_authorized_keys_status.stat.exists
+          or not hardening_root_authorized_keys_status.stat.isreg
+          or (hardening_root_authorized_keys_data.content | default('') | b64decode | trim | length) == 0)
+
+    - name: Add the user-supplied public key to the administrative user
+      ansible.builtin.blockinfile:
+        path: "/home/{{ hardening_admin_user }}/.ssh/authorized_keys"
+        create: true
+        owner: "{{ hardening_admin_user }}"
+        group: "{{ hardening_admin_user }}"
+        mode: "0600"
+        marker: "# {mark} ANSIBLE USER-SUPPLIED PUBLIC KEY"
+        block: "{{ prompt_admin_public_key.user_input | default('') | trim }}"
+      when:
+        - hardening_initial_user == 'root'
+        - (not hardening_root_authorized_keys_status.stat.exists
+          or not hardening_root_authorized_keys_status.stat.isreg
+          or (hardening_root_authorized_keys_data.content | default('') | b64decode | trim | length) == 0)
+
+    - name: Ensure administrative authorized_keys ownership and permissions
+      ansible.builtin.file:
+        path: "/home/{{ hardening_admin_user }}/.ssh/authorized_keys"
+        owner: "{{ hardening_admin_user }}"
+        group: "{{ hardening_admin_user }}"
+        mode: "0600"
+        state: file
+
+    - name: Verify same private key can log in as administrative user on current port
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - PasswordAuthentication=no
+          - -o
+          - KbdInteractiveAuthentication=no
+          - -o
+          - StrictHostKeyChecking=accept-new
+          - -o
+          - ConnectTimeout=10
+          - -i
+          - "{{ hardening_initial_private_key }}"
+          - -p
+          - "{{ hardening_initial_ssh_port | string }}"
+          - "{{ hardening_admin_user }}@{{ hardening_port_check_host }}"
+          - "true"
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      when: not hardening_local_connection
+
+    - name: Switch Ansible from bootstrap user to administrative user on current port
+      ansible.builtin.set_fact:
+        ansible_user: "{{ hardening_admin_user }}"
+        ansible_port: "{{ hardening_initial_ssh_port | int }}"
+        ansible_ssh_private_key_file: "{{ hardening_initial_private_key }}"
+        ansible_become_password: "{{ hardening_admin_password }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"
+      no_log: true
+      when: not hardening_local_connection
+
+    - name: Reset SSH connection after switching to administrative user
+      ansible.builtin.meta: reset_connection
+      when: not hardening_local_connection
+
+    - name: Verify Ansible login as administrative user
+      ansible.builtin.ping:
+      become: false
+      when: not hardening_local_connection
+
+    - name: Verify administrative sudo before changing SSH
+      ansible.builtin.command: id -u
+      become: true
+      register: hardening_admin_sudo_current_port
+      changed_when: false
+
+    - name: Require administrative sudo before changing SSH
+      ansible.builtin.assert:
+        that:
+          - hardening_admin_sudo_current_port.stdout | trim == '0'
+        fail_msg: "Administrative SSH works, but sudo/root escalation failed."
+
+    - name: Pause before changing SSH configuration
+      ansible.builtin.pause:
+        prompt: >-
+          The NEW user {{ hardening_admin_user }} can log in with the SSH key and
+          use sudo on the current port {{ hardening_initial_ssh_port }}. Type yes to
+          continue changing the SSH configuration, or no to stop safely.
+      register: hardening_pre_ssh_change_confirmation
+      when: hardening_pause
+
+    - name: Require confirmation before changing SSH configuration
+      ansible.builtin.assert:
+        that:
+          - hardening_pre_ssh_change_confirmation.user_input | default('no') | lower == 'yes'
+        fail_msg: "Stopped before changing SSH configuration."
+      when: hardening_pause
+
+    - name: Check whether ssh.socket exists
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - ssh.socket
+          - --property=LoadState
+          - --value
+      register: hardening_ssh_socket_unit
+      changed_when: false
+      failed_when: false
+
+    - name: Ensure regular SSH service is enabled and running
+      ansible.builtin.systemd_service:
+        name: ssh.service
+        enabled: true
+        state: started
+
+    - name: Ensure SSH drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Remove legacy late-loading Ansible SSH hardening file
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/99-ansible-hardening.conf
+        state: absent
+      notify: Restart SSH
+
+    - name: Write staged SSH configuration
+      ansible.builtin.copy:
+        dest: "{{ hardening_sshd_dropin }}"
+        owner: root
+        group: root
+        mode: "0600"
+        backup: true
+        content: |
+          # Managed by Ansible
+          {% for ssh_port in hardening_all_ssh_ports %}
+          Port {{ ssh_port | int }}
+          {% endfor %}
+          Protocol 2
+          PermitRootLogin prohibit-password
+          PubkeyAuthentication yes
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication no
+          PermitEmptyPasswords no
+          X11Forwarding no
+          AllowTcpForwarding yes
+          ClientAliveInterval 300
+          ClientAliveCountMax 2
+          MaxAuthTries 3
+          LoginGraceTime 30
+          AllowUsers {{ hardening_admin_user }} root
+      notify: Restart SSH
+
+    - name: Validate staged SSH configuration
+      ansible.builtin.command:
+        argv: [sshd, -t]
+      changed_when: false
+
+    - name: Read staged effective SSH configuration
+      ansible.builtin.command:
+        argv: [sshd, -T]
+      register: hardening_staged_sshd
+      changed_when: false
+
+    - name: Verify staged SSH port and public-key authentication
+      ansible.builtin.assert:
+        that:
+          - "('port ' ~ (hardening_ssh_port | string)) in hardening_staged_sshd.stdout_lines"
+          - "('port ' ~ (hardening_initial_ssh_port | string)) in hardening_staged_sshd.stdout_lines"
+          - "'pubkeyauthentication yes' in hardening_staged_sshd.stdout_lines"
+        fail_msg: >-
+          Effective sshd settings are not as expected. Check /etc/ssh/sshd_config
+          and files in /etc/ssh/sshd_config.d.
+
+    - name: Disable SSH socket activation when present
+      ansible.builtin.systemd_service:
+        name: ssh.socket
+        state: stopped
+        enabled: false
+        daemon_reload: true
+      when:
+        - hardening_ssh_socket_unit.rc == 0
+        - hardening_ssh_socket_unit.stdout | trim == 'loaded'
+      notify: Restart SSH
+
+    - name: Apply staged SSH configuration
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for final SSH port from the control server
+      ansible.builtin.wait_for:
+        host: "{{ hardening_port_check_host }}"
+        port: "{{ hardening_ssh_port | int }}"
+        state: started
+        connect_timeout: 5
+        timeout: 90
+      delegate_to: localhost
+      become: false
+
+    - name: Verify same private key on administrative user at final SSH port
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - PasswordAuthentication=no
+          - -o
+          - KbdInteractiveAuthentication=no
+          - -o
+          - StrictHostKeyChecking=accept-new
+          - -o
+          - ConnectTimeout=10
+          - -i
+          - "{{ hardening_initial_private_key }}"
+          - -p
+          - "{{ hardening_ssh_port | string }}"
+          - "{{ hardening_admin_user }}@{{ hardening_port_check_host }}"
+          - "true"
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      when: not hardening_local_connection
+
+    - name: Switch Ansible to final SSH port
+      ansible.builtin.set_fact:
+        ansible_port: "{{ hardening_ssh_port | int }}"
+      when: not hardening_local_connection
+
+    - name: Reset SSH connection after port change
+      ansible.builtin.meta: reset_connection
+
+    - name: Verify Ansible on administrative user and final port
+      ansible.builtin.ping:
+      become: false
+
+    - name: Verify sudo on final SSH port
+      ansible.builtin.command: id -u
+      become: true
+      register: hardening_admin_sudo_final_port
+      changed_when: false
+
+    - name: Require sudo on final SSH port
+      ansible.builtin.assert:
+        that:
+          - hardening_admin_sudo_final_port.stdout | trim == '0'
+        fail_msg: "Administrative sudo failed on the final SSH port."
+
+    # Docker-safe host INPUT firewall. It does not flush Docker chains or set
+    # FORWARD policy to DROP.
+    - name: Write host firewall script
+      ansible.builtin.copy:
+        dest: "{{ hardening_firewall_script }}"
+        owner: root
+        group: root
+        mode: "0700"
+        backup: true
+        content: |
+          #!/bin/sh
+          set -eu
+          IPT=/usr/sbin/iptables
+          CHAIN=ANSIBLE-HARDEN-INPUT
+
+          if ! "$IPT" -w 5 -nL "$CHAIN" >/dev/null 2>&1; then
+              "$IPT" -w 5 -N "$CHAIN"
+          fi
+
+          "$IPT" -w 5 -F "$CHAIN"
+
+          while "$IPT" -w 5 -C INPUT -j "$CHAIN" >/dev/null 2>&1; do
+              "$IPT" -w 5 -D INPUT -j "$CHAIN"
+          done
+          "$IPT" -w 5 -I INPUT 1 -j "$CHAIN"
+
+          "$IPT" -w 5 -A "$CHAIN" -i lo -j ACCEPT
+          "$IPT" -w 5 -A "$CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+          {% for ssh_port in hardening_all_ssh_ports %}
+          {% if (hardening_office_ssh_cidr | trim | length > 0) or (hardening_control_ssh_cidr | trim | length > 0) %}
+          {% if hardening_office_ssh_cidr | trim | length > 0 %}
+          "$IPT" -w 5 -A "$CHAIN" -p tcp -s {{ hardening_office_ssh_cidr | trim }} --dport {{ ssh_port | int }} -m conntrack --ctstate NEW -j ACCEPT
+          {% endif %}
+          {% if (hardening_control_ssh_cidr | trim | length > 0) and ((hardening_control_ssh_cidr | trim) != (hardening_office_ssh_cidr | trim)) %}
+          "$IPT" -w 5 -A "$CHAIN" -p tcp -s {{ hardening_control_ssh_cidr | trim }} --dport {{ ssh_port | int }} -m conntrack --ctstate NEW -j ACCEPT
+          {% endif %}
+          {% else %}
+          "$IPT" -w 5 -A "$CHAIN" -p tcp --dport {{ ssh_port | int }} -m conntrack --ctstate NEW -j ACCEPT
+          {% endif %}
+          {% endfor %}
+
+          {% if hardening_allow_http %}
+          "$IPT" -w 5 -A "$CHAIN" -p tcp --dport 80 -m conntrack --ctstate NEW -j ACCEPT
+          {% endif %}
+
+          {% if hardening_allow_https %}
+          "$IPT" -w 5 -A "$CHAIN" -p tcp --dport 443 -m conntrack --ctstate NEW -j ACCEPT
+          {% endif %}
+
+          "$IPT" -w 5 -A "$CHAIN" -p icmp --icmp-type echo-request -m limit --limit 2/second --limit-burst 4 -j ACCEPT
+          "$IPT" -w 5 -A "$CHAIN" -j DROP
+
+    - name: Write persistent host firewall service
+      ansible.builtin.copy:
+        dest: "{{ hardening_firewall_service }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Ansible host input firewall
+          After=network-online.target
+          Wants=network-online.target
+          Before=docker.service containerd.service
+
+          [Service]
+          Type=oneshot
+          ExecStart={{ hardening_firewall_script }}
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reload systemd
+
+    - name: Apply host firewall
+      ansible.builtin.command:
+        argv:
+          - "{{ hardening_firewall_script }}"
+      changed_when: true
+
+    - name: Enable persistent host firewall service
+      ansible.builtin.systemd_service:
+        name: ansible-hardening-firewall.service
+        enabled: true
+        daemon_reload: true
+
+    - name: Verify final SSH port through firewall
+      ansible.builtin.wait_for:
+        host: "{{ hardening_port_check_host }}"
+        port: "{{ hardening_ssh_port | int }}"
+        state: started
+        connect_timeout: 5
+        timeout: 90
+      delegate_to: localhost
+      become: false
+
+    - name: Verify existing SSH port remains available through firewall
+      ansible.builtin.wait_for:
+        host: "{{ hardening_port_check_host }}"
+        port: "{{ hardening_initial_ssh_port | int }}"
+        state: started
+        connect_timeout: 5
+        timeout: 90
+      delegate_to: localhost
+      become: false
+      when: hardening_initial_ssh_port | int != hardening_ssh_port | int
+
+    - name: Verify same private key still works through firewall
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - PasswordAuthentication=no
+          - -o
+          - KbdInteractiveAuthentication=no
+          - -o
+          - StrictHostKeyChecking=accept-new
+          - -o
+          - ConnectTimeout=10
+          - -i
+          - "{{ hardening_initial_private_key }}"
+          - -p
+          - "{{ hardening_ssh_port | string }}"
+          - "{{ hardening_admin_user }}@{{ hardening_port_check_host }}"
+          - "true"
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      when: not hardening_local_connection
+
+    - name: Ask whether to disable the old SSH port after new-port verification
+      ansible.builtin.pause:
+        prompt: >-
+          The new SSH port {{ hardening_ssh_port }} has been verified successfully.
+          Disable the old SSH port {{ hardening_initial_ssh_port }} and use only
+          the new port? Enter yes or no. Default: no
+      register: prompt_disable_old_ssh_port
+      when:
+        - hardening_initial_ssh_port | int != hardening_ssh_port | int
+        - vault_hardening_disable_old_ssh_port is not defined
+      delegate_to: localhost
+      become: false
+
+    - name: Resolve old SSH port policy
+      ansible.builtin.set_fact:
+        hardening_disable_old_ssh_port_input: >-
+          {{ vault_hardening_disable_old_ssh_port
+             if vault_hardening_disable_old_ssh_port is defined
+             else ((prompt_disable_old_ssh_port.user_input | default('') | trim)
+                   or 'no') }}
+      when: hardening_initial_ssh_port | int != hardening_ssh_port | int
+
+    - name: Keep the single configured port when no port change is required
+      ansible.builtin.set_fact:
+        hardening_disable_old_ssh_port_input: "no"
+      when: hardening_initial_ssh_port | int == hardening_ssh_port | int
+
+    - name: Validate old SSH port policy
+      ansible.builtin.assert:
+        that:
+          - hardening_disable_old_ssh_port_input | lower in hardening_bool_answers
+        fail_msg: "Enter yes or no for disabling the old SSH port."
+
+    - name: Normalize old SSH port policy
+      ansible.builtin.set_fact:
+        hardening_disable_old_ssh_port: >-
+          {{ hardening_disable_old_ssh_port_input | trim | lower
+             in ['yes', 'y', 'true', '1'] }}
+
+    - name: Pause before final key-only and root lock
+      ansible.builtin.pause:
+        prompt: >-
+          {% if hardening_local_connection %}
+          Local Ansible execution is active and the firewall is configured for final
+          SSH port {{ hardening_ssh_port }}. Type yes to disable password-based SSH
+          and root SSH, or no to stop before those changes.
+          {% else %}
+          The NEW user {{ hardening_admin_user }} has been verified through the
+          firewall on final port {{ hardening_ssh_port }}. Type yes to disable
+          password-based SSH and root SSH, or no to stop before those changes.
+          {% endif %}
+      register: hardening_final_lock_confirmation
+      when: hardening_pause
+
+    - name: Require final lock confirmation
+      ansible.builtin.assert:
+        that:
+          - hardening_final_lock_confirmation.user_input | default('no') | lower == 'yes'
+        fail_msg: "Stopped before disabling password/root SSH."
+      when: hardening_pause
+
+    - name: Write final SSH key-only configuration
+      ansible.builtin.copy:
+        dest: "{{ hardening_sshd_dropin }}"
+        owner: root
+        group: root
+        mode: "0600"
+        backup: true
+        content: |
+          # Managed by Ansible
+          {% if hardening_disable_old_ssh_port %}
+          Port {{ hardening_ssh_port | int }}
+          {% else %}
+          {% for ssh_port in hardening_all_ssh_ports %}
+          Port {{ ssh_port | int }}
+          {% endfor %}
+          {% endif %}
+          Protocol 2
+          PermitRootLogin {{ 'no' if hardening_lock_root else 'prohibit-password' }}
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitEmptyPasswords no
+          X11Forwarding no
+          AllowTcpForwarding yes
+          ClientAliveInterval 300
+          ClientAliveCountMax 2
+          MaxAuthTries 3
+          LoginGraceTime 30
+          AllowUsers {{ hardening_admin_user }}{{ '' if hardening_lock_root else ' root' }}
+      notify: Restart SSH
+
+    - name: Validate final SSH configuration
+      ansible.builtin.command:
+        argv: [sshd, -t]
+      changed_when: false
+
+    - name: Apply final SSH configuration
+      ansible.builtin.meta: flush_handlers
+
+    - name: Confirm final SSH port is listening before removing the old listener
+      ansible.builtin.wait_for:
+        host: "{{ hardening_port_check_host }}"
+        port: "{{ hardening_ssh_port | int }}"
+        state: started
+        connect_timeout: 5
+        timeout: 90
+      delegate_to: localhost
+      become: false
+      when:
+        - hardening_disable_old_ssh_port | bool
+        - hardening_initial_ssh_port | int != hardening_ssh_port | int
+
+    - name: Read final effective SSH configuration
+      ansible.builtin.command:
+        argv: [sshd, -T]
+      register: hardening_final_sshd
+      changed_when: false
+
+    - name: Verify final SSH policy
+      ansible.builtin.assert:
+        that:
+          - "('port ' ~ (hardening_ssh_port | string)) in hardening_final_sshd.stdout_lines"
+          - >-
+            (hardening_disable_old_ssh_port | bool and
+             ('port ' ~ (hardening_initial_ssh_port | string)) not in hardening_final_sshd.stdout_lines)
+            or
+            (not (hardening_disable_old_ssh_port | bool) and
+             ('port ' ~ (hardening_initial_ssh_port | string)) in hardening_final_sshd.stdout_lines)
+          - "'pubkeyauthentication yes' in hardening_final_sshd.stdout_lines"
+          - "'passwordauthentication no' in hardening_final_sshd.stdout_lines"
+          - "'kbdinteractiveauthentication no' in hardening_final_sshd.stdout_lines"
+        fail_msg: "Final SSH configuration is not key-only as expected."
+
+    - name: Remove the old SSH port from the persistent firewall
+      ansible.builtin.replace:
+        path: "{{ hardening_firewall_script }}"
+        regexp: '^\s*"\$IPT" -w 5 -A "\$CHAIN" -p tcp(?: -s [^ ]+)? --dport {{ hardening_initial_ssh_port | int }} -m conntrack --ctstate NEW -j ACCEPT\s*$'
+        replace: ""
+      when:
+        - hardening_disable_old_ssh_port | bool
+        - hardening_initial_ssh_port | int != hardening_ssh_port | int
+      notify: Reload hardening firewall
+
+    - name: Apply the firewall after removing the old SSH port
+      ansible.builtin.meta: flush_handlers
+      when:
+        - hardening_disable_old_ssh_port | bool
+        - hardening_initial_ssh_port | int != hardening_ssh_port | int
+
+    - name: Stop any stale SSH master still listening on the old port
+      ansible.builtin.shell: |
+        set -o pipefail
+        old_pids=$(ss -H -ltnp "sport = :{{ hardening_initial_ssh_port | int }}" 2>/dev/null \
+          | grep -oE 'pid=[0-9]+' \
+          | cut -d= -f2 \
+          | sort -u)
+        if [ -n "$old_pids" ]; then
+          while read -r pid; do
+            [ "$pid" -gt 1 ] || continue
+            kill "$pid"
+          done <<< "$old_pids"
+          printf '%s\n' "$old_pids"
+        fi
+      args:
+        executable: /bin/bash
+      register: hardening_stale_ssh_pids
+      changed_when: hardening_stale_ssh_pids.stdout | trim | length > 0
+      when:
+        - hardening_disable_old_ssh_port | bool
+        - hardening_initial_ssh_port | int != hardening_ssh_port | int
+
+    - name: Verify the old SSH port is no longer reachable
+      ansible.builtin.wait_for:
+        host: "{{ hardening_port_check_host }}"
+        port: "{{ hardening_initial_ssh_port | int }}"
+        state: stopped
+        connect_timeout: 5
+        timeout: 30
+      delegate_to: localhost
+      become: false
+      when:
+        - hardening_disable_old_ssh_port | bool
+        - hardening_initial_ssh_port | int != hardening_ssh_port | int
+
+    - name: Verify final root SSH restriction
+      ansible.builtin.assert:
+        that:
+          - "'permitrootlogin no' in hardening_final_sshd.stdout_lines"
+        fail_msg: "Root SSH is still enabled."
+      when: hardening_lock_root
+
+    - name: Reset connection after final SSH policy
+      ansible.builtin.meta: reset_connection
+      when: not hardening_local_connection
+
+    - name: Verify final Ansible login
+      ansible.builtin.ping:
+      become: false
+
+    - name: Verify final sudo
+      ansible.builtin.command: id -u
+      become: true
+      register: hardening_final_sudo
+      changed_when: false
+
+    - name: Require final sudo
+      ansible.builtin.assert:
+        that:
+          - hardening_final_sudo.stdout | trim == '0'
+        fail_msg: "Administrative sudo failed after final SSH hardening."
+
+    - name: Final direct key-only SSH test from control server
+      ansible.builtin.command:
+        argv:
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - PasswordAuthentication=no
+          - -o
+          - KbdInteractiveAuthentication=no
+          - -o
+          - StrictHostKeyChecking=accept-new
+          - -o
+          - ConnectTimeout=10
+          - -i
+          - "{{ hardening_initial_private_key }}"
+          - -p
+          - "{{ hardening_ssh_port | string }}"
+          - "{{ hardening_admin_user }}@{{ hardening_port_check_host }}"
+          - "true"
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      when: not hardening_local_connection
+
+    - name: Lock root account after final administrative verification
+      ansible.builtin.user:
+        name: root
+        password_lock: true
+      when: hardening_lock_root
+
+    - name: Remove root authorized_keys after successful migration and verification
+      ansible.builtin.file:
+        path: /root/.ssh/authorized_keys
+        state: absent
+      when:
+        - hardening_lock_root
+        - hardening_remove_root_authorized_keys
+
+    - name: Update existing inventory host to final administrative connection
+      ansible.builtin.lineinfile:
+        path: "{{ inventory_file }}"
+        regexp: "^{{ inventory_hostname | regex_escape }}(?:\\s+.*)?$"
+        line: >-
+          {{ inventory_hostname }}
+          ansible_host={{ ansible_host }}
+          ansible_user={{ hardening_admin_user }}
+          ansible_port={{ hardening_ssh_port | int }}
+          ansible_ssh_private_key_file={{ hardening_initial_private_key }}
+        backup: true
+      delegate_to: localhost
+      become: false
+      when:
+        - inventory_file is defined
+        - not hardening_local_connection
+
+    - name: Enable unattended upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    - name: Configure unattended-upgrade behavior
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99-local-unattended-reboot
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          Unattended-Upgrade::Automatic-Reboot "false";
+          Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+    - name: Upgrade installed packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: safe
+        autoremove: true
+
+    - name: Configure basic kernel/network hardening
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-ansible-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.send_redirects = 0
+          net.ipv4.conf.all.accept_source_route = 0
+          net.ipv4.conf.default.accept_source_route = 0
+          net.ipv4.conf.all.rp_filter = 1
+          net.ipv4.conf.default.rp_filter = 1
+          net.ipv4.tcp_syncookies = 1
+          kernel.randomize_va_space = 2
+      notify: Reload sysctl
+
+    - name: Persist hardened tmpfs settings for /tmp
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^tmpfs\s+/tmp\s+'
+        line: "tmpfs /tmp tmpfs defaults,nosuid,nodev,noexec,mode=1777 0 0"
+        backup: true
+        state: present
+      register: hardening_tmp_fstab
+
+    - name: Apply hardened /tmp mount settings when possible
+      ansible.builtin.command:
+        argv:
+          - mount
+          - -o
+          - remount,nosuid,nodev,noexec
+          - /tmp
+      when: hardening_tmp_fstab.changed
+      changed_when: true
+      failed_when: false
+
+    - name: Configure password quality
+      ansible.builtin.copy:
+        dest: /etc/security/pwquality.conf
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+        content: |
+          minlen = 14
+          dcredit = -1
+          ucredit = -1
+          lcredit = -1
+          ocredit = -1
+          retry = 3
+
+    - name: Configure password aging defaults
+      ansible.builtin.lineinfile:
+        path: /etc/login.defs
+        regexp: "^{{ item.key }}\\s+"
+        line: "{{ item.key }}   {{ item.value }}"
+        backup: true
+      loop:
+        - { key: PASS_MAX_DAYS, value: "90" }
+        - { key: PASS_MIN_DAYS, value: "1" }
+        - { key: PASS_WARN_AGE, value: "7" }
+
+    - name: Find other interactive UID 1000+ users
+      ansible.builtin.shell: >-
+        awk -F: '$3 >= 1000 && $1 != "{{ hardening_admin_user }}" &&
+        $7 !~ /(nologin|false)$/ {print $1}' /etc/passwd
+      args:
+        executable: /bin/bash
+      register: hardening_unused_users
+      changed_when: false
+      when: hardening_lock_unused_users
+
+    - name: Lock other interactive UID 1000+ users
+      ansible.builtin.user:
+        name: "{{ item }}"
+        password_lock: true
+      loop: "{{ hardening_unused_users.stdout_lines | default([]) }}"
+      when: hardening_lock_unused_users
+
+    - name: Fail if any account has an empty password field
+      ansible.builtin.shell: 'awk -F: ''($2 == "") {print $1}'' /etc/shadow'
+      args:
+        executable: /bin/bash
+      register: hardening_empty_passwords
+      changed_when: false
+      failed_when: hardening_empty_passwords.stdout | trim | length > 0
+      no_log: true
+
+    - name: Configure sudo logging and pty
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/hardening
+        owner: root
+        group: root
+        mode: "0440"
+        backup: true
+        validate: "/usr/sbin/visudo -cf %s"
+        content: |
+          Defaults logfile="/var/log/sudo.log"
+          Defaults use_pty
+          Defaults timestamp_timeout=5
+
+    - name: Write audit rules
+      ansible.builtin.copy:
+        dest: /etc/audit/rules.d/hardening.rules
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          -a always,exit -F arch=b64 -S adjtimex -S settimeofday -k time-change
+          -w /usr/sbin/useradd -p x -k user-modification
+          -w /usr/sbin/usermod -p x -k user-modification
+          -w /usr/sbin/userdel -p x -k user-modification
+          -a always,exit -F arch=b64 -S chmod -S chown -k perm-modification
+          -w /var/log/sudo.log -p wa -k sudo_actions
+          -w /etc/ssh/sshd_config -p wa -k sshd_config
+          -w /etc/ssh/sshd_config.d -p wa -k sshd_config
+      notify: Reload audit rules
+
+    - name: Enable auditd
+      ansible.builtin.systemd_service:
+        name: auditd
+        enabled: true
+        state: started
+
+    - name: Configure remote syslog
+      ansible.builtin.lineinfile:
+        path: /etc/rsyslog.conf
+        line: "*.* @@{{ hardening_remote_syslog_target }}"
+        insertafter: EOF
+        backup: true
+      notify: Restart rsyslog
+      when: hardening_remote_syslog
+
+    - name: Disable unnecessary services when installed
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: false
+        state: stopped
+      loop:
+        - cups.service
+        - avahi-daemon.service
+      failed_when: false
+
+    - name: Purge unwanted packages
+      ansible.builtin.apt:
+        name:
+          - isc-dhcp-server
+          - xserver-xorg-core
+        state: absent
+        purge: true
+
+    - name: Check AIDE database
+      ansible.builtin.stat:
+        path: /var/lib/aide/aide.db
+      register: hardening_aide_db
+
+    - name: Initialize AIDE database
+      ansible.builtin.command:
+        argv: [aideinit]
+      when: not hardening_aide_db.stat.exists
+      changed_when: true
+
+    - name: Promote initial AIDE database if generated
+      ansible.builtin.copy:
+        remote_src: true
+        src: /var/lib/aide/aide.db.new
+        dest: /var/lib/aide/aide.db
+        owner: root
+        group: root
+        mode: "0600"
+      when: not hardening_aide_db.stat.exists
+      failed_when: false
+
+    - name: Ensure AIDE log directory exists
+      ansible.builtin.file:
+        path: /var/log/aide
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Configure daily AIDE check
+      ansible.builtin.copy:
+        dest: /etc/cron.d/aide-check
+        owner: root
+        group: root
+        mode: "0644"
+        content: "0 1 * * * root /usr/bin/aide --check >> /var/log/aide/aide-check.log 2>&1\n"
+
+    - name: Run all pending handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Display completion guidance
+      ansible.builtin.debug:
+        msg:
+          - "Linux and SSH hardening completed."
+          - "Final SSH: {{ hardening_admin_user }}@{{ ansible_host }}:{{ hardening_ssh_port }}"
+          - >-
+            {{ 'Old SSH port ' ~ hardening_initial_ssh_port ~ ' was disabled; only the new port is active.'
+               if hardening_disable_old_ssh_port and hardening_initial_ssh_port | int != hardening_ssh_port | int
+               else 'The old SSH port remains enabled alongside the new port.' }}
+          - >-
+            {{ 'Local execution was used; control-server SSH-key verification was skipped.'
+               if hardening_local_connection
+               else 'The same control-server private key is reused: ' ~ hardening_initial_private_key }}
+          - "All previous root authorized_keys entries were migrated to {{ hardening_admin_user }} when bootstrapping from root."
+          - "Root authorized_keys was removed after successful verification when requested."
+          - "Password SSH authentication is disabled."
+          - >-
+            {{ 'inventory.ini remains configured for the local control connection.'
+               if hardening_local_connection
+               else 'inventory.ini was updated to the final administrative user, port, and same key.' }}
+          - "The custom firewall protects host INPUT without flushing Docker FORWARD chains."
+          - "IPv4 host firewall rules are configured; review IPv6 separately if public IPv6 is enabled."
+          - "Keep provider-console access available until a reboot/reconnection test succeeds."
+
+  handlers:
+    - name: Restart SSH
+      ansible.builtin.systemd_service:
+        name: ssh.service
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: Reload audit rules
+      ansible.builtin.command:
+        argv: [augenrules, --load]
+      changed_when: true
+
+    - name: Restart rsyslog
+      ansible.builtin.systemd_service:
+        name: rsyslog
+        state: restarted
+
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    - name: Reload hardening firewall
+      ansible.builtin.systemd_service:
+        name: ansible-hardening-firewall.service
+        state: restarted
+        enabled: true
+
+    - name: Reload sysctl
+      ansible.builtin.command:
+        argv: [sysctl, --system]
+      changed_when: true

@@ -1,0 +1,4537 @@
+---
+- name: Deploy one Laravel web application using the original script workflow
+  hosts: hardening_target
+  become: true
+  gather_facts: true
+
+  # These prompts are a fallback only. If the same variables are supplied
+  # with -e @vars/project.yml (including an Ansible Vault-encrypted file),
+  # Ansible uses the supplied values and skips the corresponding prompts.
+  # Otherwise, each prompt uses its matching vault_<variable_name> value as
+  # the default. Seed prompts use vault_seed_* names for shorter .env mapping.
+  vars_prompt:
+    - name: laravel_project_name
+      prompt: "Project name"
+      private: false
+      default: "{{ vault_laravel_project_name | default('myapp') }}"
+    - name: laravel_repo
+      prompt: "Laravel project repo URL (HTTPS, e.g. https://github.com/user/repo.git)"
+      private: false
+      default: "{{ vault_laravel_repo | default('') }}"
+    - name: laravel_webapp_name_input
+      prompt: "Web app folder name (leave blank to use PROJECT_NAME-REPO_NAME)"
+      private: false
+      default: "{{ vault_laravel_webapp_name_input | default('') }}"
+    - name: laravel_branch
+      prompt: "Git branch"
+      private: false
+      default: "{{ vault_laravel_branch | default('main') }}"
+    - name: laravel_domain
+      prompt: "Domain/subdomain"
+      private: false
+      default: "{{ vault_laravel_domain | default('app.local') }}"
+    - name: laravel_use_db_input
+      prompt: "Use database? (y/n)"
+      private: false
+      default: "{{ vault_laravel_use_db_input | default('n') }}"
+    - name: laravel_use_geoserver_input
+      prompt: "Use GeoServer? (y/n)"
+      private: false
+      default: "{{ vault_laravel_use_geoserver_input | default('n') }}"
+    - name: laravel_pii_setup_input
+      prompt: "Configure the PII encryption feature? (y/n)"
+      private: false
+      default: "{{ vault_laravel_pii_setup_input | default('n') }}"
+    - name: laravel_empty_database_input
+      prompt: "Is the database completely empty? (y/n)"
+      private: false
+      default: "{{ vault_laravel_empty_database_input | default('n') }}"
+    - name: laravel_npm_setup_input
+      prompt: "Run npm setup? (y/n)"
+      private: false
+      default: "{{ vault_laravel_npm_setup_input | default('y') }}"
+    - name: laravel_base_path
+      prompt: "Base path"
+      private: false
+      default: "{{ vault_laravel_base_path | default('/home/innovative') }}"
+    - name: laravel_template_repo
+      prompt: "Docker template repository"
+      private: false
+      default: "{{ vault_laravel_template_repo | default('https://github.com/imis-base-docker.git') }}"
+    - name: laravel_template_branch
+      prompt: "Docker template Git branch"
+      private: false
+      default: "{{ vault_laravel_template_branch | default('main') }}"
+    - name: laravel_proceed_existing_input
+      prompt: "Proceed if the project directory already exists? (y/n)"
+      private: false
+      default: "{{ vault_laravel_proceed_existing_input | default('n') }}"
+    - name: laravel_db_type
+      prompt: "Database type (local/remote); ignored when database is disabled"
+      private: false
+      default: "{{ vault_laravel_db_type | default('local') }}"
+    - name: laravel_pg_network
+      prompt: "PostgreSQL network name; kept for parity with the Bash prompt"
+      private: false
+      default: "{{ vault_laravel_pg_network | default('postgres14_backend') }}"
+    - name: laravel_shared_web_network
+      prompt: "Shared web Docker network name"
+      private: false
+      default: "{{ vault_laravel_shared_web_network | default('shared-web') }}"
+    - name: docker_verify_clickjacking_headers_input
+      prompt: "Verify Laravel-owned clickjacking headers in shared Nginx? (yes/no)"
+      private: false
+      default: "{{ vault_docker_verify_clickjacking_headers_input | default('yes') }}"
+    - name: docker_clickjacking_verification_url
+      prompt: "Optional public URL for final clickjacking-header verification (blank to skip)"
+      private: false
+      default: "{{ vault_docker_clickjacking_verification_url | default('') }}"
+    - name: laravel_php_version
+      prompt: "PHP major.minor.patch version for PHP, Artisan and Composer containers"
+      private: false
+      default: "{{ vault_laravel_php_version | default('8.2.35') }}"
+
+    - name: laravel_db_host
+      prompt: "PostgreSQL container name or database host"
+      private: false
+      default: "{{ vault_laravel_db_host | default('postgres14') }}"
+    - name: laravel_db_port
+      prompt: "Database port"
+      private: false
+      default: "{{ vault_laravel_db_port | default('5432') }}"
+    - name: laravel_db_name
+      prompt: "Database name; leave blank to use project name"
+      private: false
+      default: "{{ vault_laravel_db_name | default('') }}"
+    - name: laravel_db_user
+      prompt: "Database username"
+      private: false
+      default: "{{ vault_laravel_db_user | default('app') }}"
+    - name: laravel_db_password
+      prompt: "Database user password; leave blank when database is disabled"
+      private: true
+      confirm: true
+      default: "{{ vault_laravel_db_password | default('') }}"
+    - name: laravel_geoserver_workspace
+      prompt: "GeoServer workspace name; ignored when GeoServer is disabled"
+      private: false
+      default: "{{ vault_laravel_geoserver_workspace | default('workspace') }}"
+    - name: laravel_geoserver_auth_key
+      prompt: "GeoServer AuthKey secret (optional; press Enter to skip)"
+      private: true
+      default: "{{ vault_laravel_geoserver_auth_key | default('') }}"
+    - name: laravel_google_api_key
+      prompt: "Google API key (optional; press Enter to skip)"
+      private: true
+      default: "{{ vault_laravel_google_api_key | default('') }}"
+    - name: laravel_app_name
+      prompt: "App name"
+      private: false
+      default: "{{ vault_laravel_app_name | default('Laravel') }}"
+    - name: laravel_app_env
+      prompt: "App environment (local/production)"
+      private: false
+      default: "{{ vault_laravel_app_env | default('production') }}"
+    - name: laravel_app_debug
+      prompt: "App debug (true/false)"
+      private: false
+      default: "{{ vault_laravel_app_debug | default('false') }}"
+    - name: laravel_extra_env
+      prompt: "Additional environment entries separated by semicolons (KEY=value;KEY2=value2), or leave blank"
+      private: true
+      default: "{{ vault_laravel_extra_env | default('') }}"
+    - name: laravel_seed_super_admin_name
+      prompt: "SEED_SUPER_ADMIN_NAME"
+      private: false
+      default: "{{ vault_seed_super_admin_name | default('') }}"
+    - name: laravel_seed_super_admin_username
+      prompt: "SEED_SUPER_ADMIN_USERNAME"
+      private: false
+      default: "{{ vault_seed_super_admin_username | default('') }}"
+    - name: laravel_seed_super_admin_email
+      prompt: "SEED_SUPER_ADMIN_EMAIL"
+      private: false
+      default: "{{ vault_seed_super_admin_email | default('') }}"
+    - name: laravel_seed_super_admin_password
+      prompt: "SEED_SUPER_ADMIN_PASSWORD"
+      private: true
+      confirm: true
+      default: "{{ vault_seed_super_admin_password | default('') }}"
+  vars:
+    laravel_use_db: "{{ laravel_use_db_input | lower in ['y', 'yes', 'true', '1'] }}"
+    laravel_use_geoserver: "{{ laravel_use_geoserver_input | lower in ['y', 'yes', 'true', '1'] }}"
+    laravel_pii_setup: "{{ laravel_pii_setup_input | default('n') | lower in ['y', 'yes', 'true', '1'] }}"
+    laravel_database_empty: "{{ laravel_empty_database_input | default('n') | lower in ['y', 'yes', 'true', '1'] }}"
+    # PII processing always requires a successful database backup; no prompt.
+    laravel_pii_db_backup_required: true
+    laravel_pii_backfill: false
+    laravel_run_url_binding: false
+    laravel_npm_setup: "{{ laravel_npm_setup_input | lower in ['y', 'yes', 'true', '1'] }}"
+    laravel_proceed_existing: "{{ laravel_proceed_existing_input | lower in ['y', 'yes', 'true', '1'] }}"
+    laravel_project_dir: "{{ laravel_base_path }}/{{ laravel_project_name }}"
+    # Accept GitHub HTTPS URLs with or without a trailing .git or slash, then
+    # normalize them to one clean credential-free URL. Never put a username or
+    # PAT in laravel_repo or laravel_template_repo.
+    laravel_repo_clean: >-
+      {{
+        (laravel_repo | trim
+        | regex_replace('/+$', '')
+        | regex_replace('\.git$', '')) ~ '.git'
+      }}
+    laravel_template_repo_clean: >-
+      {{
+        (laravel_template_repo | trim
+        | regex_replace('/+$', '')
+        | regex_replace('\.git$', '')) ~ '.git'
+      }}
+
+    # Extract the repository name from the normalized Laravel Git URL.
+    # Example: https://github.com/org/imis-mahalaxmi.git -> imis-mahalaxmi
+    laravel_repo_name: >-
+      {{
+        laravel_repo_clean
+        | regex_replace('^.*/', '')
+        | regex_replace('\.git$', '')
+      }}
+
+    # The user may provide any valid folder name. When left blank, use
+    # PROJECT_NAME-REPO_NAME, for example base-mahalaxmi-imis-mahalaxmi.
+    laravel_webapp_name: >-
+      {{
+        laravel_webapp_name_input | trim
+        if laravel_webapp_name_input | trim | length > 0
+        else laravel_project_name ~ '-' ~ laravel_repo_name
+      }}
+
+    # Host source directory. The container application path intentionally
+    # remains based only on the project name.
+    laravel_webapp_dir: "{{ laravel_project_dir }}/src/{{ laravel_webapp_name }}"
+    laravel_container_app_dir: "/var/www/html/{{ laravel_project_name }}"
+    laravel_compose_file: "{{ laravel_base_path }}/{{ laravel_project_name }}/docker-compose.yml"
+    laravel_tools_override_file: "{{ laravel_project_dir }}/docker-compose.ansible-tools.yml"
+    laravel_package_lock_backup: "{{ laravel_webapp_dir }}/package-lock.json.ansible-original"
+    # Laravel Mix 6.0.49 imports webpack's internal SizeFormatHelpers module.
+    # webpack 5.106.x no longer provides that module at the expected path;
+    # 5.97.1 remains compatible with this legacy Mix build.
+    laravel_webpack_compat_version: "5.97.1"
+    laravel_webpackbar_compat_version: "5.0.2"
+    laravel_effective_db_name: "{{ laravel_db_name if laravel_db_name | length > 0 else laravel_project_name }}"
+    # GeoServer is reached internally over Docker DNS, not through a public URL.
+    # The GeoServer playbook attaches its container to geoserver_proxy with the
+    # container name geo.
+    laravel_geoserver_network: "{{ vault_laravel_geoserver_network | default('geoserver_proxy') }}"
+    laravel_geoserver_host: "{{ vault_laravel_geoserver_host | default('geo') }}"
+    laravel_geoserver_url: "http://{{ laravel_geoserver_host }}:8080/geoserver/"
+    laravel_geoserver_internal_url: "{{ laravel_geoserver_url }}{{ laravel_geoserver_workspace }}/"
+    laravel_mapfish_print_url: "{{ laravel_geoserver_url }}pdf/print.pdf"
+    laravel_php_container: "php-{{ laravel_project_name }}"
+    laravel_shared_nginx_dir: "{{ laravel_base_path }}/shared-nginx"
+    laravel_shared_nginx_container: "shared-nginx"
+    laravel_shared_nginx_image: "nginx:alpine"
+    laravel_shared_nginx_config_file: "{{ laravel_shared_nginx_dir }}/nginx/nginx.conf"
+    laravel_shared_project_config_file: "{{ laravel_shared_nginx_dir }}/nginx/conf.d/{{ laravel_project_name }}.conf"
+    docker_nginx_container_name: "shared-nginx"
+    laravel_queue_worker_container: "queue-worker-{{ laravel_project_name }}"
+    laravel_npm_container: "npm-{{ laravel_project_name }}"
+    laravel_composer_service: "composer"
+    laravel_npm_service: "npm"
+    # This tool image is used only for dependency install/build tasks and
+    # does not change package.json or package-lock.json.
+    laravel_node_image: "node:22-bookworm-slim"
+    laravel_node_version: "22"
+    laravel_npm_version: "10.9.2"
+    laravel_npm_tool_image: "{{ laravel_project_name }}-npm-tool:node{{ laravel_node_version }}-npm{{ laravel_npm_version }}"
+    laravel_npm_tool_dockerfile: "{{ laravel_project_dir }}/Dockerfile.ansible-npm"
+    laravel_swiper_package_json: "{{ laravel_webapp_dir }}/node_modules/swiper/package.json"
+    laravel_artisan_service: "artisan"
+    laravel_pii_key_host_file: "{{ laravel_base_path }}/secure-keys/base-imis-pii-v1.key"
+    laravel_pii_key_backup_file: "/var/backups/base-imis/secure-keys/base-imis-pii-v1.key"
+    laravel_pii_db_backup_dir: "/var/backups/base-imis/database"
+    laravel_pii_db_backup_file: "{{ laravel_pii_db_backup_dir }}/{{ laravel_project_name }}-pre-pii-{{ ansible_date_time.iso8601_basic_short }}.dump"
+    laravel_pii_key_container_file: "/run/secrets/base-imis-pii-v1.key"
+    laravel_wkhtmltopdf_image: "ghcr.io/surnet/alpine-wkhtmltopdf:3.23.4-0.12.6-full"
+    laravel_wkhtmltopdf_helper: "/tmp/ansible_fix_php_wkhtmltopdf.py"
+    docker_verify_clickjacking_headers: >-
+      {{ docker_verify_clickjacking_headers_input | trim | lower
+         in ['yes', 'y', 'true', '1'] }}
+
+    # Run every Git operation as the SSH/deployment user instead of root.
+    # The play itself uses become: true for Docker/system administration, but
+    # running Git as root against a repository owned by the deployment user
+    # triggers Git's "dubious ownership" protection. This defaults to the
+    # inventory ansible_user (for example innovative) and can be overridden
+    # from the Vault with laravel_git_user if required.
+    laravel_git_user: "{{ ansible_user | default('innovative') }}"
+
+    # Keep the temporary credential values in /run, but place the executable
+    # AskPass helper in /usr/local/bin because /run may be mounted noexec.
+    # The files are owned by laravel_git_user with restrictive permissions so
+    # Git can read them while other normal users cannot. They are removed in
+    # an always block after repository access.
+    laravel_git_askpass_path: "/usr/local/bin/ansible_github_askpass_{{ laravel_project_name }}.sh"
+    laravel_git_username_path: "/run/ansible_github_username_{{ laravel_project_name }}"
+    laravel_git_token_path: "/run/ansible_github_token_{{ laravel_project_name }}"
+    # GitHub credentials are requested later only when an unauthenticated
+    # public-access check fails for at least one repository.
+    # Preferred Vault variable names are github_username and github_token.
+    # github_password is accepted only as a backward-compatible fallback.
+
+  pre_tasks:
+    - name: Set defaults for skipped feature-specific prompts
+      ansible.builtin.set_fact:
+        laravel_db_type: "{{ laravel_db_type | default('local') }}"
+        laravel_pg_network: "{{ laravel_pg_network | default('postgres14_backend') }}"
+        laravel_db_host: "{{ laravel_db_host | default('postgres14') }}"
+        laravel_db_port: "{{ laravel_db_port | default('5432') }}"
+        laravel_db_name: "{{ laravel_db_name | default('') }}"
+        laravel_db_user: "{{ laravel_db_user | default('app') }}"
+        laravel_db_password: "{{ laravel_db_password | default('') }}"
+        laravel_geoserver_workspace: "{{ laravel_geoserver_workspace | default('workspace') }}"
+        laravel_geoserver_auth_key: "{{ laravel_geoserver_auth_key | default('') }}"
+        laravel_google_api_key: "{{ laravel_google_api_key | default('') }}"
+
+    - name: Validate deployment input
+      ansible.builtin.assert:
+        that:
+          - laravel_project_name is match('^[A-Za-z0-9_-]+$')
+          - laravel_webapp_name is match('^[A-Za-z0-9._-]+$')
+          - laravel_repo | trim | length > 0
+          - laravel_repo | trim is match('^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?$')
+          - laravel_template_repo | trim is match('^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?$')
+          - laravel_branch | length > 0
+          - laravel_template_branch | length > 0
+          - laravel_domain is match('^[A-Za-z0-9.-]+$')
+          - laravel_php_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+          - laravel_db_port | int > 0
+          - laravel_db_port | int < 65536
+          - laravel_app_debug | lower in ['true', 'false']
+          - not laravel_use_db or laravel_db_password | length > 0
+          - docker_clickjacking_verification_url | trim == '' or
+            docker_clickjacking_verification_url is match('^https?://[^ ]+$')
+        fail_msg: "One or more deployment values are invalid."
+
+    - name: Resolve deployment user UID
+      ansible.builtin.command:
+        argv:
+          - id
+          - -u
+          - "{{ laravel_git_user }}"
+      register: laravel_uid_result
+      changed_when: false
+
+    - name: Resolve deployment user GID
+      ansible.builtin.command:
+        argv:
+          - id
+          - -g
+          - "{{ laravel_git_user }}"
+      register: laravel_gid_result
+      changed_when: false
+
+    - name: Store deployment user IDs
+      ansible.builtin.set_fact:
+        laravel_uid: "{{ laravel_uid_result.stdout | trim }}"
+        laravel_gid: "{{ laravel_gid_result.stdout | trim }}"
+
+    - name: Check required commands
+      ansible.builtin.command:
+        argv: "{{ item.argv }}"
+      loop:
+        - name: Docker
+          argv: [docker, --version]
+        - name: Docker Compose
+          argv: [docker, compose, version]
+        - name: Git
+          argv: [git, --version]
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    # Check both repositories without credentials first. A successful
+    # git ls-remote means the repository is publicly readable and no GitHub
+    # credential prompt is necessary. GitHub intentionally does not reveal
+    # whether a failed unauthenticated URL is private or nonexistent, so any
+    # failure is treated as "authentication required" and is verified again
+    # during the authenticated clone.
+    - name: Check whether Docker template repository is publicly accessible
+      become: true
+      become_user: "{{ laravel_git_user }}"
+      ansible.builtin.command:
+        argv:
+          - git
+          - ls-remote
+          - "{{ laravel_template_repo_clean }}"
+      environment:
+        GIT_TERMINAL_PROMPT: "0"
+      register: laravel_template_public_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether Laravel repository is publicly accessible
+      become: true
+      become_user: "{{ laravel_git_user }}"
+      ansible.builtin.command:
+        argv:
+          - git
+          - ls-remote
+          - "{{ laravel_repo_clean }}"
+      environment:
+        GIT_TERMINAL_PROMPT: "0"
+      register: laravel_repo_public_check
+      changed_when: false
+      failed_when: false
+
+    - name: Store repository access status
+      ansible.builtin.set_fact:
+        laravel_template_repo_public: "{{ laravel_template_public_check.rc == 0 }}"
+        laravel_repo_public: "{{ laravel_repo_public_check.rc == 0 }}"
+        github_auth_required: >-
+          {{ laravel_template_public_check.rc != 0 or laravel_repo_public_check.rc != 0 }}
+
+    - name: Show repository access mode
+      ansible.builtin.debug:
+        msg:
+          - "Docker template repository public: {{ laravel_template_repo_public }}"
+          - "Laravel repository public: {{ laravel_repo_public }}"
+          - >-
+            {{ 'GitHub credentials are required for at least one repository.'
+               if github_auth_required
+               else 'Both repositories are public; GitHub credentials will not be requested.' }}
+
+    # github_username/github_token or vault_github_username/vault_github_token
+    # may come from an encrypted vars file. If they were not supplied, keep
+    # the original interactive fallback.
+    - name: Ask for GitHub username only when authentication is required and no value was supplied
+      ansible.builtin.pause:
+        prompt: >-
+          GitHub username [press Enter to use vault_github_username when configured]
+        echo: true
+      register: github_username_prompt
+      when:
+        - github_auth_required
+        - github_username | default(vault_github_username | default('')) | trim | length == 0
+      no_log: true
+
+    - name: Ask for GitHub token only when authentication is required and no value was supplied
+      ansible.builtin.pause:
+        prompt: >-
+          GitHub token [press Enter to use vault_github_token when configured]
+        echo: false
+      register: github_token_prompt
+      when:
+        - github_auth_required
+        - github_token | default(github_password | default(vault_github_token | default(''))) | length == 0
+      no_log: true
+
+    - name: Resolve GitHub credentials from Vault variables or interactive fallback
+      ansible.builtin.set_fact:
+        github_username_effective: >-
+          {{
+            github_username | default(vault_github_username | default('')) | trim
+            if github_username | default(vault_github_username | default('')) | trim | length > 0
+            else github_username_prompt.user_input | default(vault_github_username | default('')) | trim
+          }}
+        github_token_effective: >-
+          {{
+            github_token | default(github_password | default(vault_github_token | default('')))
+            if github_token | default(github_password | default(vault_github_token | default(''))) | length > 0
+            else github_token_prompt.user_input | default(vault_github_token | default(''))
+          }}
+      when: github_auth_required
+      no_log: true
+
+    - name: Validate GitHub credentials were supplied
+      ansible.builtin.assert:
+        that:
+          - github_username_effective | default('') | length > 0
+          - github_token_effective | default('') | length > 0
+        fail_msg: >-
+          GitHub username and token are required for a private
+          repository. Supply github_username/github_token in the encrypted
+          vars file or enter them when prompted.
+      when: github_auth_required
+      no_log: true
+
+    - name: Check base path
+      ansible.builtin.stat:
+        path: "{{ laravel_base_path }}"
+      register: laravel_base_stat
+
+    - name: Require existing base path
+      ansible.builtin.assert:
+        that:
+          - laravel_base_stat.stat.isdir | default(false)
+        fail_msg: "Base path does not exist: {{ laravel_base_path }}"
+
+    - name: Check project directory
+      ansible.builtin.stat:
+        path: "{{ laravel_project_dir }}"
+      register: laravel_project_stat
+
+    - name: Require confirmation before using an existing project directory
+      ansible.builtin.assert:
+        that:
+          - not laravel_project_stat.stat.exists or laravel_proceed_existing
+        fail_msg: "Project directory already exists. Rerun and approve proceeding only after reviewing it."
+
+    # Previous playbook versions could create/modify the repository as root.
+    # Normalize ownership before any Git operation so reruns do not fail with
+    # "detected dubious ownership" or write-permission errors.
+    - name: Ensure existing project tree is owned by the Git deployment user
+      ansible.builtin.file:
+        path: "{{ laravel_project_dir }}"
+        owner: "{{ laravel_git_user }}"
+        recurse: true
+      when:
+        - laravel_project_stat.stat.exists
+        - laravel_proceed_existing
+
+  tasks:
+    # Bash STEPS 2-3 - Clone the Docker template and Laravel source.
+    #
+    # IMPORTANT:
+    # GitHub credentials are NEVER embedded in an HTTPS repository URL.
+    # For private repositories, a temporary GIT_ASKPASS helper reads the
+    # username/token from deployment-user-only files. Git therefore stores only
+    # the normalized clean URL in .git/config, for example:
+    #   https://github.com/ORG/REPOSITORY.git
+    #
+    # Clone/ls-remote tasks intentionally do NOT use no_log. Their command
+    # lines contain only clean URLs, so a Git failure remains visible instead
+    # of being replaced by Ansible's "censored" message. The credential-file
+    # creation tasks remain no_log and the files are deleted in an always block.
+    # All repository operations run as laravel_git_user, avoiding root-owned Git
+    # state and Git's dubious-ownership protection on reruns.
+    - name: Clone repositories using clean GitHub URLs
+      block:
+        - name: Create temporary GitHub username file
+          ansible.builtin.copy:
+            dest: "{{ laravel_git_username_path }}"
+            owner: "{{ laravel_git_user }}"
+            mode: "0600"
+            content: "{{ github_username_effective | default('') }}\n"
+          when: github_auth_required
+          no_log: true
+
+        - name: Create temporary GitHub token file
+          ansible.builtin.copy:
+            dest: "{{ laravel_git_token_path }}"
+            owner: "{{ laravel_git_user }}"
+            mode: "0600"
+            content: "{{ github_token_effective | default('') }}\n"
+          when: github_auth_required
+          no_log: true
+
+        - name: Create temporary GitHub AskPass helper
+          ansible.builtin.copy:
+            dest: "{{ laravel_git_askpass_path }}"
+            owner: "{{ laravel_git_user }}"
+            mode: "0700"
+            content: |
+              #!/bin/sh
+              case "$1" in
+                *Username*)
+                  cat "{{ laravel_git_username_path }}"
+                  ;;
+                *Password*)
+                  cat "{{ laravel_git_token_path }}"
+                  ;;
+                *)
+                  exit 1
+                  ;;
+              esac
+          when: github_auth_required
+          no_log: true
+
+        # Validate private repository credentials before attempting a clone.
+        # The token is not part of argv/stdout/stderr, so authentication errors
+        # remain visible and useful for troubleshooting.
+        - name: Verify authenticated Docker template repository access
+          become: true
+          become_user: "{{ laravel_git_user }}"
+          ansible.builtin.command:
+            argv:
+              - git
+              - ls-remote
+              - "{{ laravel_template_repo_clean }}"
+          environment:
+            GIT_TERMINAL_PROMPT: "0"
+            GIT_ASKPASS: "{{ laravel_git_askpass_path }}"
+            GIT_ASKPASS_REQUIRE: "force"
+          changed_when: false
+          when: not laravel_template_repo_public
+
+        - name: Verify authenticated Laravel repository access
+          become: true
+          become_user: "{{ laravel_git_user }}"
+          ansible.builtin.command:
+            argv:
+              - git
+              - ls-remote
+              - "{{ laravel_repo_clean }}"
+          environment:
+            GIT_TERMINAL_PROMPT: "0"
+            GIT_ASKPASS: "{{ laravel_git_askpass_path }}"
+            GIT_ASKPASS_REQUIRE: "force"
+          changed_when: false
+          when: not laravel_repo_public
+
+        # Bash STEP 2 - Clone and prepare the Docker template.
+        - name: Check whether the Docker template is already prepared
+          ansible.builtin.stat:
+            path: "{{ laravel_compose_file }}"
+          register: laravel_template_ready
+
+        - name: Clone the public Docker template repository
+          become: true
+          become_user: "{{ laravel_git_user }}"
+          ansible.builtin.git:
+            repo: "{{ laravel_template_repo_clean }}"
+            dest: "{{ laravel_project_dir }}"
+            depth: 1
+            version: "{{ laravel_template_branch }}"
+          environment:
+            GIT_TERMINAL_PROMPT: "0"
+          when:
+            - not laravel_template_ready.stat.exists
+            - laravel_template_repo_public
+
+        - name: Clone the private Docker template repository
+          become: true
+          become_user: "{{ laravel_git_user }}"
+          ansible.builtin.git:
+            repo: "{{ laravel_template_repo_clean }}"
+            dest: "{{ laravel_project_dir }}"
+            depth: 1
+            version: "{{ laravel_template_branch }}"
+          environment:
+            GIT_TERMINAL_PROMPT: "0"
+            GIT_ASKPASS: "{{ laravel_git_askpass_path }}"
+            GIT_ASKPASS_REQUIRE: "force"
+          when:
+            - not laravel_template_ready.stat.exists
+            - not laravel_template_repo_public
+
+        - name: Check Docker template Git metadata
+          ansible.builtin.stat:
+            path: "{{ laravel_project_dir }}/.git/config"
+          register: laravel_template_git_config
+
+        - name: Ensure Docker template origin URL contains no credentials
+          become: true
+          become_user: "{{ laravel_git_user }}"
+          ansible.builtin.command:
+            argv:
+              - git
+              - remote
+              - set-url
+              - origin
+              - "{{ laravel_template_repo_clean }}"
+          args:
+            chdir: "{{ laravel_project_dir }}"
+          register: laravel_template_origin_clean
+          changed_when: false
+          when: laravel_template_git_config.stat.exists
+
+        # Bash STEP 3 - Clone the Laravel source.
+        - name: Check whether Laravel source is already present
+          ansible.builtin.stat:
+            path: "{{ laravel_webapp_dir }}/composer.json"
+          register: laravel_source_ready
+
+        - name: Ensure the Laravel source parent exists
+          ansible.builtin.file:
+            path: "{{ laravel_project_dir }}/src"
+            state: directory
+            owner: "{{ laravel_uid }}"
+            group: "{{ laravel_gid }}"
+            mode: "0755"
+
+        - name: Clone the public Laravel repository
+          become: true
+          become_user: "{{ laravel_git_user }}"
+          ansible.builtin.git:
+            repo: "{{ laravel_repo_clean }}"
+            dest: "{{ laravel_webapp_dir }}"
+            version: "{{ laravel_branch }}"
+            depth: 1
+          environment:
+            GIT_TERMINAL_PROMPT: "0"
+          when:
+            - not laravel_source_ready.stat.exists
+            - laravel_repo_public
+
+        - name: Clone the private Laravel repository
+          become: true
+          become_user: "{{ laravel_git_user }}"
+          ansible.builtin.git:
+            repo: "{{ laravel_repo_clean }}"
+            dest: "{{ laravel_webapp_dir }}"
+            version: "{{ laravel_branch }}"
+            depth: 1
+          environment:
+            GIT_TERMINAL_PROMPT: "0"
+            GIT_ASKPASS: "{{ laravel_git_askpass_path }}"
+            GIT_ASKPASS_REQUIRE: "force"
+          when:
+            - not laravel_source_ready.stat.exists
+            - not laravel_repo_public
+
+        - name: Check Laravel Git metadata
+          ansible.builtin.stat:
+            path: "{{ laravel_webapp_dir }}/.git/config"
+          register: laravel_source_git_config
+
+        - name: Ensure Laravel origin URL contains no credentials
+          become: true
+          become_user: "{{ laravel_git_user }}"
+          ansible.builtin.command:
+            argv:
+              - git
+              - remote
+              - set-url
+              - origin
+              - "{{ laravel_repo_clean }}"
+          args:
+            chdir: "{{ laravel_webapp_dir }}"
+          register: laravel_source_origin_clean
+          changed_when: false
+          when: laravel_source_git_config.stat.exists
+
+        - name: Read Laravel origin URL for verification
+          become: true
+          become_user: "{{ laravel_git_user }}"
+          ansible.builtin.command:
+            argv:
+              - git
+              - remote
+              - get-url
+              - origin
+          args:
+            chdir: "{{ laravel_webapp_dir }}"
+          register: laravel_source_origin_url
+          changed_when: false
+          when: laravel_source_git_config.stat.exists
+
+        - name: Verify Laravel origin URL is clean
+          ansible.builtin.assert:
+            that:
+              - laravel_source_origin_url.stdout | trim == laravel_repo_clean
+              - "'@github.com' not in (laravel_source_origin_url.stdout | trim)"
+            fail_msg: >-
+              Laravel origin URL is not clean. Expected {{ laravel_repo_clean }},
+              got {{ laravel_source_origin_url.stdout | default('unknown') | trim }}.
+          when: laravel_source_git_config.stat.exists
+
+      always:
+        - name: Remove temporary GitHub AskPass helper
+          ansible.builtin.file:
+            path: "{{ laravel_git_askpass_path }}"
+            state: absent
+          changed_when: false
+          no_log: true
+
+        - name: Remove temporary GitHub username file
+          ansible.builtin.file:
+            path: "{{ laravel_git_username_path }}"
+            state: absent
+          changed_when: false
+          no_log: true
+
+        - name: Remove temporary GitHub token file
+          ansible.builtin.file:
+            path: "{{ laravel_git_token_path }}"
+            state: absent
+          changed_when: false
+          no_log: true
+
+    # Keep the Laravel repository .git directory so future git status/pull
+    # operations can be performed directly from the deployed source folder.
+    # Its origin URL is intentionally stored without username/password/PAT.
+
+    # Bash STEP 4 - Replace template names and internal application paths.
+    #
+    # Older versions created timestamped backups while scanning every file
+    # under dockerfiles. On each rerun, those backup files were scanned and
+    # backed up again, causing continuously growing file names.
+    - name: Find obsolete timestamped Ansible backup files
+      ansible.builtin.find:
+        paths:
+          - "{{ laravel_project_dir }}"
+        file_type: file
+        recurse: true
+        use_regex: true
+        patterns:
+          - '.*\.[0-9]+\.[0-9]{4}-[0-9]{2}-[0-9]{2}@[0-9]{2}:[0-9]{2}:[0-9]{2}~$'
+      register: laravel_obsolete_timestamp_backups
+
+    - name: Remove obsolete timestamped Ansible backup files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ laravel_obsolete_timestamp_backups.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Check stable Docker Compose backup
+      ansible.builtin.stat:
+        path: "{{ laravel_compose_file }}.pre_ansible"
+      register: laravel_compose_stable_backup
+
+    - name: Create one stable Docker Compose backup
+      ansible.builtin.copy:
+        src: "{{ laravel_compose_file }}"
+        dest: "{{ laravel_compose_file }}.pre_ansible"
+        remote_src: true
+        mode: preserve
+      when: not laravel_compose_stable_backup.stat.exists
+
+    - name: Repair duplicated generated names from older non-idempotent playbook runs
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        python3 <<'PY'
+        import os
+        import re
+        from pathlib import Path
+
+        project_dir = Path(os.environ["PROJECT_DIR"])
+        compose_file = Path(os.environ["COMPOSE_FILE"])
+        project_name = os.environ["PROJECT_NAME"]
+        container_app_dir = os.environ["CONTAINER_APP_DIR"]
+
+        # Older revisions matched the prefix "imis" again after it had already
+        # been replaced.  For an imis-choma project that could produce values
+        # such as imis-choma-choma on each rerun.  Repair only that historical
+        # pattern; already-correct values remain untouched.
+        if not project_name.startswith("imis"):
+            print("UNCHANGED")
+            raise SystemExit(0)
+
+        repeated_suffix = project_name[len("imis"):]
+        if not repeated_suffix:
+            print("UNCHANGED")
+            raise SystemExit(0)
+
+        expected_tokens = [
+            f"nginx-{project_name}",
+            f"php-{project_name}",
+            f"queue-worker-{project_name}",
+            f"composer-{project_name}",
+            f"npm-{project_name}",
+            f"artisan-{project_name}",
+            container_app_dir,
+        ]
+
+        patterns = [
+            (
+                re.compile(re.escape(expected) + f"(?:{re.escape(repeated_suffix)})+"),
+                expected,
+            )
+            for expected in expected_tokens
+        ]
+
+        files = [compose_file]
+        dockerfiles_dir = project_dir / "dockerfiles"
+        if dockerfiles_dir.is_dir():
+            for path in dockerfiles_dir.rglob("*"):
+                if path.is_file() and (
+                    path.name.endswith(".dockerfile")
+                    or path.name.endswith(".conf")
+                    or path.name.endswith(".ini")
+                ):
+                    files.append(path)
+
+        changed_files = []
+        for path in files:
+            try:
+                original = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+
+            updated = original
+            for pattern, replacement in patterns:
+                updated = pattern.sub(replacement, updated)
+
+            if updated != original:
+                path.write_text(updated, encoding="utf-8")
+                changed_files.append(str(path))
+
+        if changed_files:
+            print("UPDATED")
+            for path in changed_files:
+                print(path)
+        else:
+            print("UNCHANGED")
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        PROJECT_DIR: "{{ laravel_project_dir }}"
+        COMPOSE_FILE: "{{ laravel_compose_file }}"
+        PROJECT_NAME: "{{ laravel_project_name }}"
+        CONTAINER_APP_DIR: "{{ laravel_container_app_dir }}"
+      register: laravel_duplicate_name_repair
+      changed_when: "'UPDATED' in laravel_duplicate_name_repair.stdout"
+
+    - name: Replace Docker Compose template placeholders
+      ansible.builtin.replace:
+        path: "{{ laravel_compose_file }}"
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+        backup: false
+      loop:
+        # Rename only the HOST Laravel source folder in Compose. This avoids
+        # accidentally replacing the application path inside the containers.
+        - regexp: 'src/(?:imis-revamp2\.0|web_app)(?![A-Za-z0-9_.-])'
+          replace: "src/{{ laravel_webapp_name }}"
+
+        # Container names are generated from the project name.
+        - {
+            regexp: "nginx-imis(?![A-Za-z0-9_-])",
+            replace: "nginx-{{ laravel_project_name }}",
+          }
+        - {
+            regexp: "php-imis(?![A-Za-z0-9_-])",
+            replace: "php-{{ laravel_project_name }}",
+          }
+        - {
+            regexp: "queue-worker-imis(?![A-Za-z0-9_-])",
+            replace: "queue-worker-{{ laravel_project_name }}",
+          }
+        - {
+            regexp: "composer-imis(?![A-Za-z0-9_-])",
+            replace: "composer-{{ laravel_project_name }}",
+          }
+        - {
+            regexp: "npm-imis(?![A-Za-z0-9_-])",
+            replace: "npm-{{ laravel_project_name }}",
+          }
+        - {
+            regexp: "artisan-imis(?![A-Za-z0-9_-])",
+            replace: "artisan-{{ laravel_project_name }}",
+          }
+
+        # The application path inside containers is also project-specific.
+        - regexp: "/var/www/html/(?:imis|web_app)(?![A-Za-z0-9_.-])"
+          replace: "{{ laravel_container_app_dir }}"
+
+    - name: Find only active Docker template files
+      ansible.builtin.find:
+        paths: "{{ laravel_project_dir }}/dockerfiles"
+        file_type: file
+        recurse: true
+        use_regex: false
+        patterns:
+          - "*.dockerfile"
+          - "*.conf"
+          - "*.ini"
+        excludes:
+          - "*.bak.ansible"
+          - "*.pre_ansible"
+          - "*~"
+      register: laravel_docker_template_files
+
+    - name: Replace old IMIS application paths in active Docker template files
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: "/var/www/html/(?:imis|web_app)(?![A-Za-z0-9_.-])"
+        replace: "{{ laravel_container_app_dir }}"
+        backup: false
+      loop: "{{ laravel_docker_template_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Ensure Python YAML support is installed before reading Compose
+      ansible.builtin.apt:
+        name: python3-yaml
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install Dockerfile correction helper
+      ansible.builtin.copy:
+        dest: "{{ laravel_wkhtmltopdf_helper }}"
+        owner: root
+        group: root
+        mode: "0700"
+        content: |
+          import os
+          import re
+          from pathlib import Path
+
+          import yaml
+
+          compose_file = Path(os.environ["COMPOSE_FILE"]).resolve()
+          php_version = os.environ["PHP_VERSION"]
+          php_container = os.environ["PHP_CONTAINER"]
+          artisan_service = os.environ["ARTISAN_SERVICE"]
+          composer_service = os.environ["COMPOSER_SERVICE"]
+          wkhtmltopdf_image = os.environ["WKHTMLTOPDF_IMAGE"]
+
+          with compose_file.open("r", encoding="utf-8") as stream:
+              compose = yaml.safe_load(stream)
+
+          if not isinstance(compose, dict):
+              raise SystemExit(f"Invalid Docker Compose YAML: {compose_file}")
+
+          services = compose.get("services")
+          if not isinstance(services, dict):
+              raise SystemExit("Docker Compose services section is missing or invalid")
+
+
+          def find_service_by_container_name(container_name):
+              for service_name, service in services.items():
+                  if (
+                      isinstance(service, dict)
+                      and service.get("container_name") == container_name
+                  ):
+                      return service_name
+              return None
+
+
+          def resolve_dockerfile(service_name):
+              service = services.get(service_name)
+              if not isinstance(service, dict):
+                  return None
+
+              build = service.get("build")
+              if build is None:
+                  return None
+
+              if isinstance(build, str):
+                  context = build
+                  dockerfile = "Dockerfile"
+              elif isinstance(build, dict):
+                  context = build.get("context", ".")
+                  dockerfile = build.get("dockerfile", "Dockerfile")
+              else:
+                  raise SystemExit(
+                      f"Unsupported build configuration for service {service_name}"
+                  )
+
+              context_path = Path(context)
+              if not context_path.is_absolute():
+                  context_path = (compose_file.parent / context_path).resolve()
+
+              dockerfile_path = Path(dockerfile)
+              if not dockerfile_path.is_absolute():
+                  dockerfile_path = (context_path / dockerfile_path).resolve()
+
+              return dockerfile_path
+
+
+          def remove_managed_block(content, begin_marker, end_marker):
+              pattern = re.compile(
+                  rf"(?ms)^{re.escape(begin_marker)}\r?\n.*?"
+                  rf"^{re.escape(end_marker)}(?:\r?\n)?"
+              )
+              return pattern.sub("", content)
+
+
+          def split_dockerfile_chunks(content):
+              """Split Dockerfile text into logical instructions and plain lines."""
+              chunks = []
+              current = []
+
+              for line in content.splitlines(keepends=True):
+                  stripped = line.strip()
+
+                  if not current and (not stripped or stripped.startswith("#")):
+                      chunks.append(line)
+                      continue
+
+                  current.append(line)
+
+                  # A trailing backslash continues the current instruction.
+                  if line.rstrip("\r\n").rstrip().endswith("\\"):
+                      continue
+
+                  chunks.append("".join(current))
+                  current = []
+
+              if current:
+                  chunks.append("".join(current))
+
+              return chunks
+
+
+          def is_apk_add_instruction(chunk):
+              if not re.match(r"(?is)^\s*RUN\b", chunk):
+                  return False
+
+              # Supports both `apk add` and `apk --no-cache add` forms.
+              return bool(
+                  re.search(
+                      r"(?is)\bapk\b(?:(?!\b(?:apk|RUN)\b).)*?\badd\b",
+                      chunk,
+                  )
+              )
+
+
+          def remove_package_from_instruction(chunk, package):
+              package_pattern = re.compile(
+                  rf"(?<![A-Za-z0-9_.+-]){re.escape(package)}"
+                  rf"(?![A-Za-z0-9_.+-])"
+              )
+
+              if not package_pattern.search(chunk):
+                  return chunk
+
+              original_lines = chunk.splitlines(keepends=True)
+              cleaned_lines = []
+
+              for line in original_lines:
+                  cleaned = package_pattern.sub("", line)
+                  line_ending = ""
+
+                  if cleaned.endswith("\r\n"):
+                      line_ending = "\r\n"
+                      body = cleaned[:-2]
+                  elif cleaned.endswith("\n"):
+                      line_ending = "\n"
+                      body = cleaned[:-1]
+                  else:
+                      body = cleaned
+
+                  # Remove a continuation line that contained only the package.
+                  if body.strip() in {"", "\\"}:
+                      continue
+
+                  body = re.sub(r"[ \t]{2,}", " ", body).rstrip()
+                  cleaned_lines.append(body + line_ending)
+
+              # If the removed package was the final continuation item,
+              # remove the now-invalid trailing backslash from the prior line.
+              if cleaned_lines:
+                  last = cleaned_lines[-1]
+                  newline = ""
+                  if last.endswith("\r\n"):
+                      newline = "\r\n"
+                      body = last[:-2]
+                  elif last.endswith("\n"):
+                      newline = "\n"
+                      body = last[:-1]
+                  else:
+                      body = last
+
+                  if body.rstrip().endswith("\\"):
+                      body = body.rstrip()[:-1].rstrip()
+                      cleaned_lines[-1] = body + newline
+
+              return "".join(cleaned_lines)
+
+
+          def remove_wkhtmltopdf_from_apk_instructions(content):
+              updated_chunks = []
+
+              for chunk in split_dockerfile_chunks(content):
+                  if is_apk_add_instruction(chunk):
+                      chunk = remove_package_from_instruction(
+                          chunk,
+                          "wkhtmltopdf",
+                      )
+                  updated_chunks.append(chunk)
+
+              return "".join(updated_chunks)
+
+
+          def find_apk_instruction_with_package(content, package):
+              package_pattern = re.compile(
+                  rf"(?<![A-Za-z0-9_.+-]){re.escape(package)}"
+                  rf"(?![A-Za-z0-9_.+-])"
+              )
+
+              for chunk in split_dockerfile_chunks(content):
+                  if is_apk_add_instruction(chunk) and package_pattern.search(chunk):
+                      return chunk
+
+              return None
+
+
+          php_service = find_service_by_container_name(php_container)
+          if php_service is None and "php" in services:
+              php_service = "php"
+
+          if php_service is None:
+              raise SystemExit(
+                  f"Could not find the PHP service for container {php_container}"
+              )
+
+          php_dockerfile = resolve_dockerfile(php_service)
+          artisan_dockerfile = resolve_dockerfile(artisan_service)
+          composer_dockerfile = resolve_dockerfile(composer_service)
+
+          required = {
+              f"PHP service '{php_service}'": php_dockerfile,
+              f"Composer service '{composer_service}'": composer_dockerfile,
+          }
+
+          missing = [
+              f"{label}: {path}"
+              for label, path in required.items()
+              if path is None or not path.is_file()
+          ]
+          if missing:
+              raise SystemExit(
+                  "Required Dockerfile(s) could not be resolved from "
+                  "docker-compose.yml: " + "; ".join(missing)
+              )
+
+          runtime_dockerfiles = [php_dockerfile]
+          if artisan_dockerfile is not None:
+              if not artisan_dockerfile.is_file():
+                  raise SystemExit(
+                      "Artisan Dockerfile was resolved from Compose but was not found: "
+                      f"{artisan_dockerfile}"
+                  )
+              runtime_dockerfiles.append(artisan_dockerfile)
+
+          runtime_dockerfiles = list(dict.fromkeys(runtime_dockerfiles))
+
+          changed = False
+          modified_paths = []
+
+
+          def write_if_changed(path, original, updated):
+              global changed
+
+              if updated == original:
+                  return
+
+              backup = path.with_name(path.name + ".bak.ansible")
+              if not backup.exists():
+                  backup.write_text(original, encoding="utf-8")
+
+              path.write_text(updated, encoding="utf-8")
+              modified_paths.append(str(path))
+              changed = True
+
+
+          stage_begin = "# BEGIN ANSIBLE MANAGED WKHTMLTOPDF STAGE"
+          stage_end = "# END ANSIBLE MANAGED WKHTMLTOPDF STAGE"
+          runtime_begin = "# BEGIN ANSIBLE MANAGED WKHTMLTOPDF RUNTIME"
+          runtime_end = "# END ANSIBLE MANAGED WKHTMLTOPDF RUNTIME"
+          zip_begin = "# BEGIN ANSIBLE MANAGED PHP ZIP EXTENSION"
+          zip_end = "# END ANSIBLE MANAGED PHP ZIP EXTENSION"
+
+          stage_block = (
+              f"{stage_begin}\n"
+              f"FROM {wkhtmltopdf_image} AS wkhtmltopdf\n"
+              f"{stage_end}\n\n"
+          )
+
+          runtime_block = (
+              f"\n{runtime_begin}\n"
+              "RUN apk add --no-cache \\\n"
+              "    libstdc++ \\\n"
+              "    libx11 \\\n"
+              "    libxrender \\\n"
+              "    libxext \\\n"
+              "    libssl3 \\\n"
+              "    ca-certificates \\\n"
+              "    fontconfig \\\n"
+              "    freetype \\\n"
+              "    ttf-dejavu \\\n"
+              "    ttf-droid \\\n"
+              "    ttf-freefont \\\n"
+              "    ttf-liberation\n\n"
+              "COPY --from=wkhtmltopdf "
+              "/bin/wkhtmltopdf /bin/wkhtmltopdf\n"
+              "COPY --from=wkhtmltopdf "
+              "/bin/wkhtmltoimage /bin/wkhtmltoimage\n"
+              "COPY --from=wkhtmltopdf "
+              "/lib/libwkhtmltox* /lib/\n\n"
+              "RUN chmod 0755 "
+              "/bin/wkhtmltopdf /bin/wkhtmltoimage\n"
+              f"{runtime_end}\n"
+          )
+
+          zip_block = (
+              f"\n{zip_begin}\n"
+              "RUN apk add --no-cache libzip-dev zip unzip \\\n"
+              "    && apk add --no-cache --virtual .zip-build-deps $PHPIZE_DEPS \\\n"
+              "    && docker-php-ext-install zip \\\n"
+              "    && docker-php-ext-enable zip \\\n"
+              "    && apk del .zip-build-deps\n"
+              f"{zip_end}\n"
+          )
+
+          php_from_pattern = re.compile(
+              r"(?m)^FROM[ \t]+php:[^\s]+"
+              r"(?P<alias>[ \t]+AS[ \t]+\S+)?[ \t]*$"
+          )
+
+          for dockerfile in runtime_dockerfiles:
+              original = dockerfile.read_text(encoding="utf-8")
+              updated = original
+
+              updated = remove_managed_block(updated, stage_begin, stage_end)
+              updated = remove_managed_block(updated, runtime_begin, runtime_end)
+              updated = remove_managed_block(updated, zip_begin, zip_end)
+              updated = updated.lstrip("\r\n")
+
+              updated, replacements = php_from_pattern.subn(
+                  lambda match: (
+                      f"FROM php:{php_version}-fpm-alpine"
+                      f"{match.group('alias') or ''}"
+                  ),
+                  updated,
+                  count=1,
+              )
+
+              if replacements != 1:
+                  raise SystemExit(
+                      f"Could not identify a PHP base image in {dockerfile}"
+                  )
+
+              updated = remove_wkhtmltopdf_from_apk_instructions(updated)
+
+              php_from_match = php_from_pattern.search(updated)
+              if php_from_match is None:
+                  raise SystemExit(
+                      f"Could not find the pinned PHP FROM line in {dockerfile}"
+                  )
+
+              before_php_stage = updated[:php_from_match.start()].rstrip("\r\n")
+              php_stage_and_after = updated[php_from_match.start():].lstrip("\r\n")
+              if before_php_stage:
+                  before_php_stage += "\n\n"
+
+              updated = before_php_stage + stage_block + php_stage_and_after
+
+              php_from_match = php_from_pattern.search(updated)
+              if php_from_match is None:
+                  raise SystemExit(
+                      f"Could not find the PHP runtime stage in {dockerfile}"
+                  )
+
+              insert_at = php_from_match.end()
+              content_after_php_from = updated[insert_at:].lstrip("\r\n")
+              updated = (
+                  updated[:insert_at]
+                  + runtime_block
+                  + zip_block
+                  + "\n"
+                  + content_after_php_from
+              )
+
+              write_if_changed(dockerfile, original, updated)
+
+          original = composer_dockerfile.read_text(encoding="utf-8")
+          updated = original
+
+          updated = remove_managed_block(updated, zip_begin, zip_end)
+
+          composer_from_pattern = re.compile(
+              r"(?m)^FROM[ \t]+\S+"
+              r"(?P<alias>[ \t]+AS[ \t]+\S+)?[ \t]*$"
+          )
+          updated, replacements = composer_from_pattern.subn(
+              lambda match: (
+                  f"FROM php:{php_version}-cli-alpine"
+                  f"{match.group('alias') or ''}"
+              ),
+              updated,
+              count=1,
+          )
+
+          if replacements != 1:
+              raise SystemExit(
+                  f"Could not identify the Composer base image in {composer_dockerfile}"
+              )
+
+          composer_from_match = composer_from_pattern.search(updated)
+          if composer_from_match is None:
+              raise SystemExit(
+                  f"Could not find the Composer FROM line in {composer_dockerfile}"
+              )
+
+          insert_at = composer_from_match.end()
+          content_after_composer_from = updated[insert_at:]
+          if zip_begin not in content_after_composer_from.split(
+              "ENTRYPOINT", 1
+          )[0]:
+              updated = (
+                  updated[:insert_at]
+                  + zip_block
+                  + content_after_composer_from
+              )
+
+          composer_copy = (
+              "COPY --from=composer:2 "
+              "/usr/bin/composer /usr/local/bin/composer"
+          )
+
+          if composer_copy not in updated:
+              first_from = composer_from_pattern.search(updated)
+              if first_from is None:
+                  raise SystemExit(
+                      f"Could not find the Composer FROM line in {composer_dockerfile}"
+                  )
+
+              insert_at = first_from.end()
+              updated = (
+                  updated[:insert_at]
+                  + "\n\n"
+                  + composer_copy
+                  + updated[insert_at:]
+              )
+
+          updated = re.sub(
+              r'(?m)^ENTRYPOINT\s+\[\s*"composer"\s*\]\s*$\n?',
+              "",
+              updated,
+          ).rstrip() + '\n\nENTRYPOINT ["composer"]\n'
+
+          write_if_changed(composer_dockerfile, original, updated)
+
+          expected_fpm = f"FROM php:{php_version}-fpm-alpine"
+          expected_cli = f"FROM php:{php_version}-cli-alpine"
+
+          for dockerfile in runtime_dockerfiles:
+              content = dockerfile.read_text(encoding="utf-8")
+              required_runtime_items = (
+                  expected_fpm,
+                  f"FROM {wkhtmltopdf_image} AS wkhtmltopdf",
+                  "COPY --from=wkhtmltopdf "
+                  "/bin/wkhtmltopdf /bin/wkhtmltopdf",
+                  "COPY --from=wkhtmltopdf "
+                  "/bin/wkhtmltoimage /bin/wkhtmltoimage",
+                  "COPY --from=wkhtmltopdf "
+                  "/lib/libwkhtmltox* /lib/",
+                  "docker-php-ext-install zip",
+              )
+
+              for expected in required_runtime_items:
+                  if expected not in content:
+                      raise SystemExit(
+                          f"Dockerfile verification failed: "
+                          f"{expected} is missing from {dockerfile}"
+                      )
+
+              invalid_instruction = find_apk_instruction_with_package(
+                  content,
+                  "wkhtmltopdf",
+              )
+              if invalid_instruction is not None:
+                  raise SystemExit(
+                      "The unavailable Alpine wkhtmltopdf package is still "
+                      f"present in an apk add instruction in {dockerfile}:\n"
+                      f"{invalid_instruction}"
+                  )
+
+          composer_content = composer_dockerfile.read_text(encoding="utf-8")
+          for expected in (
+              expected_cli,
+              composer_copy,
+              'ENTRYPOINT ["composer"]',
+              "docker-php-ext-install zip",
+          ):
+              if expected not in composer_content:
+                  raise SystemExit(
+                      f"Composer Dockerfile verification failed: "
+                      f"{expected} is missing from {composer_dockerfile}"
+                  )
+
+          print("UPDATED" if changed else "UNCHANGED")
+          print(f"PHP service: {php_service}")
+          print(f"PHP Dockerfile: {php_dockerfile}")
+          if artisan_dockerfile is not None:
+              print(f"Artisan Dockerfile: {artisan_dockerfile}")
+          else:
+              print("Artisan service has no separate build Dockerfile.")
+          print(f"Composer Dockerfile: {composer_dockerfile}")
+          print(f"wkhtmltopdf image: {wkhtmltopdf_image}")
+          if modified_paths:
+              print("Modified Dockerfiles: " + ", ".join(modified_paths))
+
+    - name: Pin PHP and configure wkhtmltopdf build stages
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ laravel_wkhtmltopdf_helper }}"
+      environment:
+        COMPOSE_FILE: "{{ laravel_compose_file }}"
+        PHP_VERSION: "{{ laravel_php_version }}"
+        PHP_CONTAINER: "{{ laravel_php_container }}"
+        ARTISAN_SERVICE: "{{ laravel_artisan_service }}"
+        COMPOSER_SERVICE: "{{ laravel_composer_service }}"
+        WKHTMLTOPDF_IMAGE: "{{ laravel_wkhtmltopdf_image }}"
+      register: laravel_php_dockerfile_update
+      changed_when: "'UPDATED' in laravel_php_dockerfile_update.stdout"
+
+    - name: Remove Dockerfile correction helper
+      ansible.builtin.file:
+        path: "{{ laravel_wkhtmltopdf_helper }}"
+        state: absent
+      changed_when: false
+
+    - name: Show updated Dockerfiles
+      ansible.builtin.debug:
+        var: laravel_php_dockerfile_update.stdout_lines
+
+    - name: Show generated application path inside containers
+      ansible.builtin.debug:
+        msg: >-
+          Project {{ laravel_project_name }} will use
+          {{ laravel_container_app_dir }} inside its containers.
+
+    # Bash STEP 5 - Create shared-web and update Compose network references.
+    - name: Inspect shared-web Docker network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - "{{ laravel_shared_web_network }}"
+      register: laravel_shared_web_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create shared-web Docker network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - create
+          - --driver
+          - bridge
+          - "{{ laravel_shared_web_network }}"
+      when: laravel_shared_web_check.rc != 0
+      changed_when: true
+
+    - name: Create shared Nginx directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ laravel_shared_nginx_dir }}/nginx"
+        - "{{ laravel_shared_nginx_dir }}/nginx/conf.d"
+
+    - name: Render the main shared Nginx configuration
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/08_shared_nginx_nginx.conf.j2"
+        dest: "{{ laravel_shared_nginx_config_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+
+    - name: Inspect existing shared-nginx container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ laravel_shared_nginx_container }}"
+      register: laravel_shared_nginx_existing
+      changed_when: false
+      failed_when: false
+
+    - name: Create shared-nginx container when missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - -d
+          - --name
+          - "{{ laravel_shared_nginx_container }}"
+          - --hostname
+          - "{{ laravel_shared_nginx_container }}"
+          - --restart
+          - unless-stopped
+          - --security-opt
+          - no-new-privileges:true
+          - --read-only
+          - --pids-limit
+          - "256"
+          - --memory
+          - "256m"
+          - --cpus
+          - "1.0"
+          - -v
+          - "{{ laravel_shared_nginx_dir }}/nginx/conf.d:/etc/nginx/conf.d:ro"
+          - -v
+          - "{{ laravel_shared_nginx_config_file }}:/etc/nginx/nginx.conf:ro"
+          - -v
+          - "{{ laravel_base_path }}:/srv/projects:ro"
+          - --tmpfs
+          - /var/cache/nginx:rw,nosuid,nodev,noexec,size=64m,mode=1777
+          - --tmpfs
+          - /var/run:rw,nosuid,nodev,noexec,size=8m,mode=0755
+          - --tmpfs
+          - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+          - --network
+          - "{{ laravel_shared_web_network }}"
+          - --entrypoint
+          - nginx
+          - "{{ laravel_shared_nginx_image }}"
+          - -g
+          - "daemon off;"
+      when: laravel_shared_nginx_existing.rc != 0
+      register: laravel_shared_nginx_created
+      changed_when: true
+
+    - name: Inspect shared-nginx npm-network attachment
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - '{{ ''{{json (index .NetworkSettings.Networks "npm-network")}}'' }}'
+          - "{{ laravel_shared_nginx_container }}"
+      register: laravel_shared_nginx_npm_network
+      changed_when: false
+      failed_when: false
+
+    - name: Connect shared-nginx to npm-network when missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - connect
+          - npm-network
+          - "{{ laravel_shared_nginx_container }}"
+      when: >-
+        laravel_shared_nginx_npm_network.rc != 0
+        or laravel_shared_nginx_npm_network.stdout | trim in ['', 'null', '<no value>']
+      changed_when: true
+
+    - name: Validate the initial shared Nginx configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --network
+          - "{{ laravel_shared_web_network }}"
+          - --read-only
+          - --tmpfs
+          - /var/cache/nginx:rw,nosuid,nodev,noexec,size=64m,mode=1777
+          - --tmpfs
+          - /var/run:rw,nosuid,nodev,noexec,size=8m,mode=0755
+          - --tmpfs
+          - /tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777
+          - -v
+          - "{{ laravel_shared_nginx_dir }}/nginx/conf.d:/etc/nginx/conf.d:ro"
+          - -v
+          - "{{ laravel_shared_nginx_config_file }}:/etc/nginx/nginx.conf:ro"
+          - --entrypoint
+          - nginx
+          - "{{ laravel_shared_nginx_image }}"
+          - -t
+      changed_when: false
+
+    - name: Check recovery backup for the Compose file
+      ansible.builtin.stat:
+        path: "{{ laravel_compose_file }}.bak.ansible"
+      register: laravel_compose_recovery_backup
+
+    - name: Validate current Compose file before network changes
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - config
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_compose_before_network
+      changed_when: false
+      failed_when: false
+
+    - name: Restore the last valid Compose backup when current YAML is invalid
+      ansible.builtin.copy:
+        src: "{{ laravel_compose_file }}.bak.ansible"
+        dest: "{{ laravel_compose_file }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - laravel_compose_before_network.rc != 0
+        - laravel_compose_recovery_backup.stat.exists
+
+    - name: Require a valid Compose file before structural editing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - config
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_compose_recovered
+      changed_when: false
+      failed_when: laravel_compose_recovered.rc != 0
+
+    - name: Save a valid recovery copy before shared-web changes
+      ansible.builtin.copy:
+        src: "{{ laravel_compose_file }}"
+        dest: "{{ laravel_compose_file }}.bak.ansible"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+
+    - name: Attach PHP service to shared-web without requiring per-project Nginx
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        python3 <<'PY'
+        import os
+        from pathlib import Path
+
+        import yaml
+
+        compose_path = Path(os.environ["COMPOSE_FILE"])
+        php_container = os.environ["PHP_CONTAINER"]
+        shared_web_network = os.environ["SHARED_WEB_NETWORK"]
+
+        with compose_path.open("r", encoding="utf-8") as stream:
+            compose = yaml.safe_load(stream)
+
+        if not isinstance(compose, dict):
+            raise SystemExit("Compose file must contain a top-level YAML mapping")
+
+        services = compose.get("services")
+        if not isinstance(services, dict) or not services:
+            raise SystemExit("Compose file must contain a non-empty services mapping")
+
+        changed = False
+        legacy_network_names = {"laravel"}
+
+        # Modern Compose ignores the legacy version key.
+        if "version" in compose:
+            compose.pop("version")
+            changed = True
+
+        # shared-nginx talks directly to php-PROJECT:9000.  A project-specific
+        # nginx container is therefore not required by this deployment playbook.
+        php_service_name = None
+
+        for service_name, service in services.items():
+            if not isinstance(service, dict):
+                continue
+            if service.get("container_name") == php_container:
+                php_service_name = service_name
+                break
+
+        # Original template normally calls this service "php".
+        if php_service_name is None and "php" in services:
+            php_service_name = "php"
+
+        if php_service_name is None:
+            available = ", ".join(services.keys())
+            raise SystemExit(
+                f"Could not find PHP service for container {php_container}. "
+                f"Available services: {available}"
+            )
+
+        php_service = services[php_service_name]
+        networks = php_service.get("networks")
+
+        # Attach every application service to the shared external network.
+        # This matches the reference Compose layout and allows shared Nginx
+        # and the application-side services to use the same Docker network.
+        for service_name, service in services.items():
+            if not isinstance(service, dict):
+                continue
+
+            networks = service.get("networks")
+            if isinstance(networks, list):
+                filtered_networks = [
+                    network
+                    for network in networks
+                    if network not in legacy_network_names
+                ]
+                if filtered_networks != networks:
+                    service["networks"] = filtered_networks
+                    networks = filtered_networks
+                    changed = True
+                if shared_web_network not in networks:
+                    networks.append(shared_web_network)
+                    changed = True
+            elif isinstance(networks, dict):
+                for legacy_network in legacy_network_names:
+                    if legacy_network in networks:
+                        networks.pop(legacy_network)
+                        changed = True
+                if shared_web_network not in networks:
+                    networks[shared_web_network] = None
+                    changed = True
+            elif networks is None:
+                service["networks"] = [shared_web_network]
+                changed = True
+            else:
+                raise SystemExit(
+                    f"Unsupported networks configuration for service {service_name}"
+                )
+
+        top_networks = compose.setdefault("networks", {})
+        if not isinstance(top_networks, dict):
+            raise SystemExit("Top-level networks must be a YAML mapping")
+
+        for legacy_network in legacy_network_names:
+            if legacy_network in top_networks and legacy_network != shared_web_network:
+                top_networks.pop(legacy_network)
+                changed = True
+
+        required_shared_network = {
+            "external": True,
+            "name": shared_web_network,
+        }
+
+        if top_networks.get(shared_web_network) != required_shared_network:
+            top_networks[shared_web_network] = required_shared_network
+            changed = True
+
+        if changed:
+            temporary_path = compose_path.with_name(compose_path.name + ".tmp")
+            with temporary_path.open("w", encoding="utf-8") as stream:
+                yaml.safe_dump(
+                    compose,
+                    stream,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+            temporary_path.replace(compose_path)
+
+        print(f"PHP service: {php_service_name}")
+        print("UPDATED" if changed else "UNCHANGED")
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        COMPOSE_FILE: "{{ laravel_compose_file }}"
+        PHP_CONTAINER: "{{ laravel_php_container }}"
+        SHARED_WEB_NETWORK: "{{ laravel_shared_web_network }}"
+      register: laravel_shared_web_update
+      changed_when: "'UPDATED' in laravel_shared_web_update.stdout"
+
+    - name: Validate Compose after shared-web update
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - config
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_compose_after_network
+      changed_when: false
+      failed_when: laravel_compose_after_network.rc != 0
+
+    - name: Remove the per-project Nginx service when shared Nginx is enabled
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        python3 <<'PY'
+        import os
+        from pathlib import Path
+
+        import yaml
+
+        compose_path = Path(os.environ["COMPOSE_FILE"])
+        nginx_container = os.environ["NGINX_CONTAINER"]
+
+        with compose_path.open("r", encoding="utf-8") as stream:
+            compose = yaml.safe_load(stream)
+
+        services = compose.get("services") if isinstance(compose, dict) else None
+        if not isinstance(services, dict):
+            raise SystemExit("Compose file must contain a services mapping")
+
+        removed = []
+        for service_name, service in list(services.items()):
+            if isinstance(service, dict) and service.get("container_name") == nginx_container:
+                del services[service_name]
+                removed.append(service_name)
+
+        if removed:
+            temporary_path = compose_path.with_name(compose_path.name + ".tmp")
+            with temporary_path.open("w", encoding="utf-8") as stream:
+                yaml.safe_dump(
+                    compose,
+                    stream,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+            temporary_path.replace(compose_path)
+            print("UPDATED: " + ", ".join(removed))
+        else:
+            print("UNCHANGED")
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        COMPOSE_FILE: "{{ laravel_compose_file }}"
+        NGINX_CONTAINER: "nginx-{{ laravel_project_name }}"
+      register: laravel_project_nginx_removal
+      changed_when: "'UPDATED' in laravel_project_nginx_removal.stdout"
+
+    - name: Remove stale per-project Nginx container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - container
+          - rm
+          - --force
+          - "nginx-{{ laravel_project_name }}"
+      register: laravel_stale_nginx_removal
+      changed_when: laravel_stale_nginx_removal.rc == 0
+      failed_when: false
+
+    - name: Attach the PHP service to the external PostgreSQL network
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        python3 <<'PY'
+        import os
+        from pathlib import Path
+
+        import yaml
+
+        compose_path = Path(os.environ["COMPOSE_FILE"])
+        php_container = os.environ["PHP_CONTAINER"]
+        queue_worker_container = os.environ["QUEUE_WORKER_CONTAINER"]
+        pg_network = os.environ["PG_NETWORK"]
+
+        with compose_path.open("r", encoding="utf-8") as stream:
+            compose = yaml.safe_load(stream)
+
+        if not isinstance(compose, dict):
+            raise SystemExit("Compose file must contain a top-level YAML mapping")
+
+        services = compose.get("services")
+        if not isinstance(services, dict) or not services:
+            raise SystemExit("Compose file must contain a non-empty services mapping")
+
+        changed = False
+
+        required_containers = {php_container, queue_worker_container}
+        found_containers = set()
+
+        for service_name, service in services.items():
+            if not isinstance(service, dict):
+                continue
+
+            container_name = service.get("container_name")
+            if container_name not in required_containers:
+                continue
+
+            found_containers.add(container_name)
+            networks = service.get("networks")
+
+            if isinstance(networks, list):
+                if pg_network not in networks:
+                    networks.append(pg_network)
+                    service["networks"] = networks
+                    changed = True
+            elif isinstance(networks, dict):
+                if pg_network not in networks:
+                    networks[pg_network] = None
+                    changed = True
+            else:
+                service["networks"] = [pg_network]
+                changed = True
+
+        missing_containers = required_containers - found_containers
+        if missing_containers:
+            raise SystemExit(
+                "Could not find required application container(s): "
+                + ", ".join(sorted(missing_containers))
+            )
+
+        top_networks = compose.setdefault("networks", {})
+        if not isinstance(top_networks, dict):
+            raise SystemExit("Top-level networks must be a YAML mapping")
+
+        required_pg_network = {
+            "external": True,
+            "name": pg_network,
+        }
+
+        if top_networks.get(pg_network) != required_pg_network:
+            top_networks[pg_network] = required_pg_network
+            changed = True
+
+        if changed:
+            temporary_path = compose_path.with_name(compose_path.name + ".tmp")
+            with temporary_path.open("w", encoding="utf-8") as stream:
+                yaml.safe_dump(
+                    compose,
+                    stream,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
+            temporary_path.replace(compose_path)
+
+        print("UPDATED" if changed else "UNCHANGED")
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        COMPOSE_FILE: "{{ laravel_compose_file }}"
+        PHP_CONTAINER: "{{ laravel_php_container }}"
+        QUEUE_WORKER_CONTAINER: "{{ laravel_queue_worker_container }}"
+        PG_NETWORK: "{{ laravel_pg_network }}"
+      register: laravel_pg_network_update
+      changed_when: "'UPDATED' in laravel_pg_network_update.stdout"
+      when: laravel_use_db
+
+    - name: Validate Compose after PostgreSQL network attach
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - config
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_compose_after_pg_network
+      changed_when: false
+      failed_when: laravel_compose_after_pg_network.rc != 0
+      when: laravel_use_db
+
+    - name: Explain the PostgreSQL network attach
+      ansible.builtin.debug:
+        msg: >-
+          Attached the PHP container to the external network
+          {{ laravel_pg_network }} so DB_HOST={{ laravel_db_host }}
+          can be resolved via Docker DNS. This runs whenever a database
+          is enabled, regardless of the local/remote answer, since
+          DB_HOST is commonly a Docker container name that only
+          resolves via the network it lives on. If that is not the
+          case for your setup, update laravel_pg_network to the
+          correct network name and rerun.
+      when: laravel_use_db
+
+    - name: Inspect GeoServer Docker network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - "{{ laravel_geoserver_network }}"
+      register: laravel_geoserver_network_check
+      changed_when: false
+      failed_when: false
+      when: laravel_use_geoserver
+
+    - name: Require GeoServer Docker network
+      ansible.builtin.assert:
+        that:
+          - laravel_geoserver_network_check.rc == 0
+        fail_msg: >-
+          GeoServer Docker network '{{ laravel_geoserver_network }}' does not
+          exist. Run the GeoServer playbook first or set the correct network name.
+      when: laravel_use_geoserver
+
+    - name: Attach Laravel services to the GeoServer network
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        python3 <<'PY'
+        import os
+        from pathlib import Path
+
+        import yaml
+
+        compose_path = Path(os.environ["COMPOSE_FILE"])
+        required_containers = {
+            os.environ["PHP_CONTAINER"],
+            os.environ["QUEUE_WORKER_CONTAINER"],
+        }
+        geoserver_network = os.environ["GEOSERVER_NETWORK"]
+
+        with compose_path.open("r", encoding="utf-8") as stream:
+            compose = yaml.safe_load(stream)
+
+        services = compose.get("services") if isinstance(compose, dict) else None
+        if not isinstance(services, dict) or not services:
+            raise SystemExit("Compose file must contain a non-empty services mapping")
+
+        found = set()
+        changed = False
+
+        for service in services.values():
+            if not isinstance(service, dict):
+                continue
+            if service.get("container_name") not in required_containers:
+                continue
+
+            found.add(service["container_name"])
+            networks = service.get("networks")
+            if isinstance(networks, list):
+                if geoserver_network not in networks:
+                    networks.append(geoserver_network)
+                    changed = True
+            elif isinstance(networks, dict):
+                if geoserver_network not in networks:
+                    networks[geoserver_network] = None
+                    changed = True
+            elif networks is None:
+                service["networks"] = [geoserver_network]
+                changed = True
+            else:
+                raise SystemExit("Unsupported networks configuration in Compose file")
+
+        missing = required_containers - found
+        if missing:
+            raise SystemExit("Missing Laravel container(s): " + ", ".join(sorted(missing)))
+
+        top_networks = compose.setdefault("networks", {})
+        required_network = {"external": True, "name": geoserver_network}
+        if top_networks.get(geoserver_network) != required_network:
+            top_networks[geoserver_network] = required_network
+            changed = True
+
+        if changed:
+            temporary_path = compose_path.with_name(compose_path.name + ".tmp")
+            with temporary_path.open("w", encoding="utf-8") as stream:
+                yaml.safe_dump(compose, stream, default_flow_style=False,
+                               sort_keys=False, allow_unicode=True)
+            temporary_path.replace(compose_path)
+
+        print("UPDATED" if changed else "UNCHANGED")
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        COMPOSE_FILE: "{{ laravel_compose_file }}"
+        PHP_CONTAINER: "{{ laravel_php_container }}"
+        QUEUE_WORKER_CONTAINER: "{{ laravel_queue_worker_container }}"
+        GEOSERVER_NETWORK: "{{ laravel_geoserver_network }}"
+      register: laravel_geoserver_network_update
+      changed_when: "'UPDATED' in laravel_geoserver_network_update.stdout"
+      when: laravel_use_geoserver
+
+    - name: Validate Compose after GeoServer network attach
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - config
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      changed_when: false
+      when: laravel_use_geoserver
+
+    - name: Explain the GeoServer network attach
+      ansible.builtin.debug:
+        msg: >-
+          Attached the Laravel PHP and queue-worker services to
+          {{ laravel_geoserver_network }}. Laravel should use
+          GEOSERVER_URL={{ laravel_geoserver_url }} through Docker DNS.
+      when: laravel_use_geoserver
+
+    # Bash STEP 8 - Create and update .env.
+    - name: Check Laravel environment files
+      ansible.builtin.stat:
+        path: "{{ laravel_webapp_dir }}/.env"
+      register: laravel_env_stat
+
+    - name: Back up the existing Laravel environment
+      ansible.builtin.copy:
+        src: "{{ laravel_webapp_dir }}/.env"
+        dest: "{{ laravel_webapp_dir }}/.env.bak.ansible"
+        remote_src: true
+        mode: preserve
+      when: laravel_env_stat.stat.exists
+      no_log: true
+
+    - name: Check .env.example
+      ansible.builtin.stat:
+        path: "{{ laravel_webapp_dir }}/.env.example"
+      register: laravel_env_example
+
+    - name: Copy .env.example exactly to .env before applying deployment inputs
+      ansible.builtin.copy:
+        src: "{{ laravel_webapp_dir }}/.env.example"
+        dest: "{{ laravel_webapp_dir }}/.env"
+        remote_src: true
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0640"
+      when:
+        - laravel_env_example.stat.exists
+      no_log: true
+
+    - name: Create a minimal Laravel environment when no example exists
+      ansible.builtin.copy:
+        dest: "{{ laravel_webapp_dir }}/.env"
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0640"
+        content: |
+          APP_NAME=Laravel
+          APP_ENV=production
+          APP_KEY=
+          APP_DEBUG=false
+          APP_URL=http://localhost
+          LOG_CHANNEL=stack
+          LOG_LEVEL=debug
+          DB_CONNECTION=pgsql
+          DB_HOST=127.0.0.1
+          DB_PORT=5432
+          DB_DATABASE=laravel
+          DB_USERNAME=laravel
+          DB_PASSWORD=
+          CACHE_DRIVER=file
+          QUEUE_CONNECTION=sync
+          SESSION_DRIVER=file
+          SESSION_LIFETIME=120
+      when:
+        - not laravel_env_stat.stat.exists
+        - not laravel_env_example.stat.exists
+      no_log: true
+
+    - name: Set core Laravel environment values
+      ansible.builtin.lineinfile:
+        path: "{{ laravel_webapp_dir }}/.env"
+        regexp: "^{{ item.key }}="
+        line: '{{ item.key }}="{{ item.value }}"'
+        create: true
+        mode: "0640"
+      loop:
+        - { key: APP_NAME, value: "{{ laravel_app_name }}" }
+        - { key: APP_ENV, value: "{{ laravel_app_env }}" }
+        - { key: APP_DEBUG, value: "{{ laravel_app_debug | lower }}" }
+        - { key: APP_URL, value: "https://{{ laravel_domain }}" }
+      no_log: true
+
+    - name: Set Laravel database environment values
+      ansible.builtin.lineinfile:
+        path: "{{ laravel_webapp_dir }}/.env"
+        regexp: "^{{ item.key }}="
+        line: '{{ item.key }}="{{ item.value }}"'
+        create: true
+        mode: "0640"
+      loop:
+        - { key: DB_HOST, value: "{{ laravel_db_host }}" }
+        - { key: DB_PORT, value: "{{ laravel_db_port }}" }
+        - { key: DB_DATABASE, value: "{{ laravel_effective_db_name }}" }
+        - { key: DB_USERNAME, value: "{{ laravel_db_user }}" }
+        - { key: DB_PASSWORD, value: "{{ laravel_db_password }}" }
+      when: laravel_use_db
+      no_log: true
+
+    - name: Add GeoServer environment values
+      ansible.builtin.lineinfile:
+        path: "{{ laravel_webapp_dir }}/.env"
+        regexp: "^{{ item.key }}="
+        line: '{{ item.key }}="{{ item.value }}"'
+        create: true
+        mode: "0640"
+      loop:
+        - {
+            key: GEOSERVER_INTERNAL_URL,
+            value: "{{ laravel_geoserver_internal_url }}",
+          }
+        - {
+            key: GEOSERVER_AUTH_KEY,
+            value: "{{ laravel_geoserver_auth_key }}",
+          }
+        - {
+            key: MAPFISH_PRINT_URL,
+            value: "{{ laravel_mapfish_print_url }}",
+          }
+        - {
+            key: API_KEY_GOOGLE,
+            value: "{{ laravel_google_api_key }}",
+          }
+        - {
+            key: GEOSERVER_WORKSPACE,
+            value: "{{ laravel_geoserver_workspace }}",
+          }
+      when: laravel_use_geoserver
+      no_log: true
+
+    - name: Add requested extra environment values
+      ansible.builtin.lineinfile:
+        path: "{{ laravel_webapp_dir }}/.env"
+        regexp: "^{{ item.split('=', 1)[0] | trim }}="
+        line: "{{ item | trim }}"
+        create: true
+        mode: "0640"
+      loop: "{{ laravel_extra_env.split(';') }}"
+      when:
+        - laravel_extra_env | trim | length > 0
+        - item | trim | length > 0
+        - "'=' in item"
+      no_log: true
+
+    - name: Write deployment seed account values to .env
+      ansible.builtin.lineinfile:
+        path: "{{ laravel_webapp_dir }}/.env"
+        regexp: "^{{ item.key }}="
+        line: '{{ item.key }}="{{ item.value }}"'
+        create: true
+        mode: "0640"
+      loop:
+        - { key: SEED_SUPER_ADMIN_NAME, value: "{{ laravel_seed_super_admin_name }}" }
+        - { key: SEED_SUPER_ADMIN_USERNAME, value: "{{ laravel_seed_super_admin_username }}" }
+        - { key: SEED_SUPER_ADMIN_EMAIL, value: "{{ laravel_seed_super_admin_email }}" }
+        - { key: SEED_SUPER_ADMIN_PASSWORD, value: "{{ laravel_seed_super_admin_password }}" }
+      no_log: true
+
+    - name: Set PII environment values
+      ansible.builtin.lineinfile:
+        path: "{{ laravel_webapp_dir }}/.env"
+        regexp: "^{{ item.key }}="
+        line: '{{ item.key }}="{{ item.value }}"'
+        create: true
+        mode: "0640"
+      loop:
+        - { key: PII_KEY_PROVIDER, value: "file" }
+        - { key: PII_ACTIVE_KEY_VERSION, value: "v1" }
+        - { key: PII_KEY_V1_FILE, value: "{{ laravel_pii_key_container_file }}" }
+        - { key: PII_KEY_V2_FILE, value: "" }
+        - { key: PII_ALLOW_LEGACY_PLAINTEXT, value: "true" }
+        - { key: PII_AUDIT_ENABLED, value: "true" }
+        - { key: PII_KEY_BACKUP_INTERVAL_DAYS, value: "60" }
+        - { key: PII_KEY_BACKUP_WARNING_DAYS, value: "5" }
+        - { key: PII_EXPORT_MAX_BINS, value: "5000" }
+        - { key: PII_EXPORT_MAX_APPLICATION_IDS, value: "5000" }
+        - { key: PII_EXPORT_MAX_TAX_CODES, value: "5000" }
+        - { key: PII_EXPORT_MAX_FILE_KB, value: "2048" }
+      when: laravel_pii_setup
+      no_log: true
+
+    - name: Create the PII key directory outside the project repository
+      ansible.builtin.file:
+        path: "{{ laravel_pii_key_host_file | dirname }}"
+        state: directory
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0700"
+      when: laravel_pii_setup
+
+    - name: Check for an existing PII encryption key
+      ansible.builtin.stat:
+        path: "{{ laravel_pii_key_host_file }}"
+      register: laravel_pii_key_stat
+      when: laravel_pii_setup
+
+    - name: Generate a PII encryption key only when one is absent
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - rand
+          - -base64
+          - "32"
+      register: laravel_pii_key_generated
+      changed_when: true
+      no_log: true
+      when:
+        - laravel_pii_setup
+        - not laravel_pii_key_stat.stat.exists
+
+    - name: Store the generated PII encryption key outside the project repository
+      ansible.builtin.copy:
+        dest: "{{ laravel_pii_key_host_file }}"
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0600"
+        content: "{{ laravel_pii_key_generated.stdout | trim }}\n"
+      no_log: true
+      when:
+        - laravel_pii_setup
+        - not laravel_pii_key_stat.stat.exists
+
+    - name: Create the protected PII key backup directory
+      ansible.builtin.file:
+        path: "{{ laravel_pii_key_backup_file | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: laravel_pii_setup
+
+    - name: Create a protected second copy of the PII encryption key
+      ansible.builtin.copy:
+        src: "{{ laravel_pii_key_host_file }}"
+        dest: "{{ laravel_pii_key_backup_file }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+        force: false
+      when: laravel_pii_setup
+      no_log: true
+
+    # Bash STEP 9 - Preserve ownership and permission behavior.
+    - name: Set project ownership to the deployment user's UID and GID
+      ansible.builtin.file:
+        path: "{{ laravel_project_dir }}"
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        recurse: true
+
+    - name: Set Laravel tree permissions
+      ansible.builtin.file:
+        path: "{{ laravel_webapp_dir }}"
+        mode: "0755"
+        recurse: true
+
+    - name: Set writable Laravel paths
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0777"
+        recurse: true
+      loop:
+        - "{{ laravel_webapp_dir }}/storage"
+        - "{{ laravel_webapp_dir }}/lang"
+        - "{{ laravel_webapp_dir }}/bootstrap/cache"
+
+    - name: Create pinned Node 22 and npm 10 tool Dockerfile
+      ansible.builtin.copy:
+        dest: "{{ laravel_npm_tool_dockerfile }}"
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0644"
+        content: |
+          FROM {{ laravel_node_image }}
+          USER root
+          RUN npm install -g npm@{{ laravel_npm_version }} \
+              && npm cache clean --force
+          ENTRYPOINT ["npm"]
+      when: laravel_npm_setup
+
+    - name: Create Compose override for writable dependency tools
+      ansible.builtin.copy:
+        dest: "{{ laravel_tools_override_file }}"
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0644"
+        content: |
+          services:
+            {{ laravel_composer_service }}:
+              user: "{{ laravel_uid }}:{{ laravel_gid }}"
+              environment:
+                COMPOSER_HOME: /tmp/composer
+            {{ laravel_npm_service }}:
+              build:
+                context: "{{ laravel_project_dir }}"
+                dockerfile: "Dockerfile.ansible-npm"
+              image: "{{ laravel_npm_tool_image }}"
+              user: "{{ laravel_uid }}:{{ laravel_gid }}"
+              environment:
+                NPM_CONFIG_CACHE: /tmp/npm-cache
+                NPM_CONFIG_UPDATE_NOTIFIER: "false"
+                NO_UPDATE_NOTIFIER: "1"
+
+    - name: Validate dependency-tools Compose override
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - config
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      changed_when: false
+
+    - name: Build pinned Node 22 and npm 10 tool image
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - build
+          - "{{ laravel_npm_service }}"
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_npm_tool_build
+      changed_when: true
+      when: laravel_npm_setup
+
+    - name: Verify pinned Node and npm versions used by deployment tools
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - run
+          - --rm
+          - --no-deps
+          - -T
+          - --entrypoint
+          - sh
+          - "{{ laravel_npm_service }}"
+          - -lc
+          - "node -v && npm -v"
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_npm_runtime_versions
+      changed_when: false
+      when: laravel_npm_setup
+
+    - name: Require exact Node and npm tool versions
+      ansible.builtin.assert:
+        that:
+          - >-
+            (laravel_npm_runtime_versions.stdout_lines |
+            select('match', '^v' ~ laravel_node_version ~ '\\.') |
+            list | length) > 0
+          - "laravel_npm_version in laravel_npm_runtime_versions.stdout_lines"
+        fail_msg: >-
+          Expected Node v{{ laravel_node_version }} and npm {{ laravel_npm_version }},
+          but the deployment tool reported: {{ laravel_npm_runtime_versions.stdout | default('unknown') }}.
+        success_msg: >-
+          Deployment NPM tool uses Node v{{ laravel_node_version }} and npm {{ laravel_npm_version }}.
+      when: laravel_npm_setup
+
+    # Bash STEP 10 - Build and start containers.
+    - name: Build and start application containers
+      ansible.builtin.command: docker compose up -d --build --remove-orphans
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_compose_up
+      changed_when: >-
+        'Created' in laravel_compose_up.stdout or
+        'Recreated' in laravel_compose_up.stdout or
+        'Started' in laravel_compose_up.stdout or
+        'Building' in laravel_compose_up.stdout
+
+    - name: Wait for the PHP container
+      ansible.builtin.command:
+        argv:
+          [
+            docker,
+            inspect,
+            -f,
+            "{{ '{{.State.Running}}' }}",
+            "{{ laravel_php_container }}",
+          ]
+      register: laravel_php_running
+      changed_when: false
+      retries: 30
+      delay: 1
+      until: laravel_php_running.stdout | trim == 'true'
+      failed_when: false
+
+    - name: Create the container PII key directory
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ laravel_php_container }}"
+          - mkdir
+          - -p
+          - "{{ laravel_pii_key_container_file | dirname }}"
+      changed_when: false
+      when: laravel_pii_setup
+
+    - name: Copy the PII key into the PHP container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - cp
+          - "{{ laravel_pii_key_host_file }}"
+          - "{{ laravel_php_container }}:{{ laravel_pii_key_container_file }}"
+      changed_when: true
+      no_log: true
+      when: laravel_pii_setup
+
+    - name: Set restrictive permissions on the container PII key
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ laravel_php_container }}"
+          - chmod
+          - "0600"
+          - "{{ laravel_pii_key_container_file }}"
+      changed_when: true
+      when: laravel_pii_setup
+
+    # Bash STEP 11 - Detect dependency files and run the correct commands.
+    - name: Check Composer manifest
+      ansible.builtin.stat:
+        path: "{{ laravel_webapp_dir }}/composer.json"
+      register: laravel_composer_json
+
+    - name: Set composer.json ownership and permissions
+      ansible.builtin.file:
+        path: "{{ laravel_webapp_dir }}/composer.json"
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0644"
+      when: laravel_composer_json.stat.exists
+
+    - name: Check Composer lock file
+      ansible.builtin.stat:
+        path: "{{ laravel_webapp_dir }}/composer.lock"
+      register: laravel_composer_lock
+
+    - name: Check NPM manifest
+      ansible.builtin.stat:
+        path: "{{ laravel_webapp_dir }}/package.json"
+      register: laravel_package_json
+
+    - name: Check NPM lock file
+      ansible.builtin.stat:
+        path: "{{ laravel_webapp_dir }}/package-lock.json"
+      register: laravel_package_lock
+
+    - name: Set package.json ownership and permissions
+      ansible.builtin.file:
+        path: "{{ laravel_webapp_dir }}/package.json"
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0644"
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Read Docker Compose service names
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - config
+          - --services
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_compose_services
+      changed_when: false
+
+    - name: Require Composer service when composer.json exists
+      ansible.builtin.assert:
+        that:
+          - laravel_composer_service in laravel_compose_services.stdout_lines
+        fail_msg: >-
+          composer.json exists, but Compose service
+          '{{ laravel_composer_service }}' was not found.
+          Available services: {{ laravel_compose_services.stdout_lines | join(', ') }}
+      when: laravel_composer_json.stat.exists
+
+    - name: Require NPM service when package.json exists
+      ansible.builtin.assert:
+        that:
+          - laravel_npm_service in laravel_compose_services.stdout_lines
+        fail_msg: >-
+          package.json exists, but Compose service
+          '{{ laravel_npm_service }}' was not found.
+          Available services: {{ laravel_compose_services.stdout_lines | join(', ') }}
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Verify composer.json is visible in the Composer tool container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - run
+          - --rm
+          - --no-deps
+          - -T
+          - -v
+          - "{{ laravel_webapp_dir }}:/app"
+          - -w
+          - /app
+          - --entrypoint
+          - sh
+          - "{{ laravel_composer_service }}"
+          - -lc
+          - "test -f composer.json && printf '%s\\n' 'composer.json found in /app'"
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      changed_when: false
+      when: laravel_composer_json.stat.exists
+
+    - name: Make composer.lock writable before Composer update
+      ansible.builtin.file:
+        path: "{{ laravel_webapp_dir }}/composer.lock"
+        state: file
+        mode: "0777"
+      when:
+        - laravel_composer_json.stat.exists
+        - laravel_composer_lock.stat.exists
+
+    - name: Run Composer update when composer.lock exists
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - run
+          - --rm
+          - --no-deps
+          - -T
+          - -v
+          - "{{ laravel_webapp_dir }}:/app"
+          - -w
+          - /app
+          - "{{ laravel_composer_service }}"
+          - update
+          - --with-all-dependencies
+          - --no-security-blocking
+          - --no-interaction
+          - --prefer-dist
+          - --optimize-autoloader
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_composer_install
+      changed_when: true
+      when:
+        - laravel_composer_json.stat.exists
+        - laravel_composer_lock.stat.exists
+
+    - name: Restore composer.lock permissions after Composer update
+      ansible.builtin.file:
+        path: "{{ laravel_webapp_dir }}/composer.lock"
+        state: file
+        mode: "0775"
+      when:
+        - laravel_composer_json.stat.exists
+        - laravel_composer_lock.stat.exists
+
+    - name: Run Composer update when only composer.json exists
+      when:
+        - laravel_composer_json.stat.exists
+        - not laravel_composer_lock.stat.exists
+      block:
+        - name: Run Composer update normally
+          ansible.builtin.command:
+            argv:
+              - docker
+              - compose
+              - -f
+              - "{{ laravel_compose_file }}"
+              - -f
+              - "{{ laravel_tools_override_file }}"
+              - run
+              - --rm
+              - --no-deps
+              - -T
+              - -v
+              - "{{ laravel_webapp_dir }}:/app"
+              - -w
+              - /app
+              - "{{ laravel_composer_service }}"
+              - update
+              - --with-all-dependencies
+              - --no-security-blocking
+              - --no-blocking
+              - --no-interaction
+              - --prefer-dist
+              - --optimize-autoloader
+          args:
+            chdir: "{{ laravel_project_dir }}"
+          register: laravel_composer_update
+          changed_when: true
+
+      rescue:
+        - name: Temporarily apply mode 0777 after Composer permission failure
+          ansible.builtin.file:
+            path: "{{ laravel_webapp_dir }}"
+            state: directory
+            mode: "0777"
+            recurse: true
+
+        - name: Retry Composer update after applying mode 0777
+          ansible.builtin.command:
+            argv:
+              - docker
+              - compose
+              - -f
+              - "{{ laravel_compose_file }}"
+              - -f
+              - "{{ laravel_tools_override_file }}"
+              - run
+              - --rm
+              - --no-deps
+              - -T
+              - -v
+              - "{{ laravel_webapp_dir }}:/app"
+              - -w
+              - /app
+              - "{{ laravel_composer_service }}"
+              - update
+              - --with-all-dependencies
+              - --no-security-blocking
+              - --no-blocking
+              - --no-interaction
+              - --prefer-dist
+              - --optimize-autoloader
+          args:
+            chdir: "{{ laravel_project_dir }}"
+          register: laravel_composer_update_retry
+          changed_when: true
+
+      always:
+        - name: Restore safer project-root permissions after Composer update
+          ansible.builtin.file:
+            path: "{{ laravel_webapp_dir }}"
+            state: directory
+            mode: "0755"
+
+        - name: Recheck composer.lock after Composer update
+          ansible.builtin.stat:
+            path: "{{ laravel_webapp_dir }}/composer.lock"
+          register: laravel_composer_lock_after_retry
+
+        - name: Set composer.lock permissions when created
+          ansible.builtin.file:
+            path: "{{ laravel_webapp_dir }}/composer.lock"
+            state: file
+            mode: "0664"
+          when: laravel_composer_lock_after_retry.stat.exists
+
+    - name: Verify installed Composer platform requirements
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - run
+          - --rm
+          - --no-deps
+          - -T
+          - -v
+          - "{{ laravel_webapp_dir }}:/app"
+          - -w
+          - /app
+          - "{{ laravel_composer_service }}"
+          - check-platform-reqs
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      changed_when: false
+      when: laravel_composer_json.stat.exists
+
+    - name: Report when Composer files are absent
+      ansible.builtin.debug:
+        msg: >-
+          composer.json was not found in {{ laravel_webapp_dir }}.
+          Composer dependency setup was skipped.
+      when: not laravel_composer_json.stat.exists
+
+    # If the application does not provide a lock file, create one with the
+    # deployment's pinned npm runtime. Once a lock file exists, the normal
+    # normalization and npm ci path below is used.
+    - name: Create package-lock.json when it is missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - run
+          - --rm
+          - --no-deps
+          - -T
+          - -v
+          - "{{ laravel_webapp_dir }}:/app"
+          - -w
+          - /app
+          - --entrypoint
+          - sh
+          - "{{ laravel_npm_service }}"
+          - -lc
+          - "npm install --package-lock-only --ignore-scripts --no-audit --no-fund"
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_package_lock_install
+      changed_when: true
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - not laravel_package_lock.stat.exists | default(false)
+
+    - name: Refresh package-lock.json status after installation
+      ansible.builtin.stat:
+        path: "{{ laravel_webapp_dir }}/package-lock.json"
+      register: laravel_package_lock
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Require package-lock.json after installation attempt
+      ansible.builtin.assert:
+        that:
+          - laravel_package_lock.stat.exists | default(false)
+        fail_msg: >-
+          package.json exists but package-lock.json could not be created.
+          Check the npm service output and the application's package.json.
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Set package-lock.json ownership and permissions
+      ansible.builtin.file:
+        path: "{{ laravel_webapp_dir }}/package-lock.json"
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0664"
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_package_lock.stat.exists | default(false)
+
+    - name: Remove existing node_modules before the frozen NPM installation
+      ansible.builtin.file:
+        path: "{{ laravel_webapp_dir }}/node_modules"
+        state: absent
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_package_lock.stat.exists | default(false)
+
+    - name: Back up package-lock.json before dependency normalization
+      ansible.builtin.copy:
+        src: "{{ laravel_webapp_dir }}/package-lock.json"
+        dest: "{{ laravel_package_lock_backup }}"
+        remote_src: true
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0644"
+        force: true
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_package_lock.stat.exists | default(false)
+
+    - name: Pin Webpack to the Laravel Mix compatible version
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - run
+          - --rm
+          - --no-deps
+          - -T
+          - -v
+          - "{{ laravel_webapp_dir }}:/app"
+          - -w
+          - /app
+          - --entrypoint
+          - sh
+          - "{{ laravel_npm_service }}"
+          - -lc
+          - >-
+            npm install --no-save --ignore-scripts --no-audit --no-fund
+            webpack@{{ laravel_webpack_compat_version }}
+            webpackbar@{{ laravel_webpackbar_compat_version }}
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_webpack_pin
+      changed_when: true
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_package_lock.stat.exists | default(false)
+
+    # Normalize legacy lockfiles before npm ci without resolving dependencies.
+    - name: Normalize package-lock.json without resolving dependencies
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - -v
+          - "{{ laravel_webapp_dir }}:/app"
+          - -w
+          - /app
+          - node:16
+          - sh
+          - -lc
+          - >-
+            LOCKFILE_VERSION=$(node -p "require('./package-lock.json').lockfileVersion || 1")
+            && if [ "$LOCKFILE_VERSION" != "1" ]; then
+            npm install --package-lock-only --lockfile-version=1
+            --ignore-scripts --no-audit --no-fund
+            && echo lockfile-normalized;
+            fi
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_lockfile_normalization
+      changed_when: "'lockfile-normalized' in laravel_lockfile_normalization.stdout"
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_package_lock.stat.exists | default(false)
+
+    - name: Install frontend dependencies from the committed lock file
+      block:
+        - name: Run npm ci with Node 22 and npm 10.9.2
+          ansible.builtin.command:
+            argv:
+              - docker
+              - compose
+              - -f
+              - "{{ laravel_compose_file }}"
+              - -f
+              - "{{ laravel_tools_override_file }}"
+              - run
+              - --rm
+              - --no-deps
+              - -T
+              - -v
+              - "{{ laravel_webapp_dir }}:/app"
+              - -w
+              - /app
+              - --entrypoint
+              - sh
+              - "{{ laravel_npm_service }}"
+              - -lc
+              - "npm ci --no-audit --no-fund"
+          args:
+            chdir: "{{ laravel_project_dir }}"
+          register: laravel_npm_ci
+          changed_when: true
+
+      rescue:
+        # Retry once with a fresh ephemeral npm cache. This addresses npm
+        # cache corruption without changing package.json or package-lock.json.
+        - name: Retry npm ci after clearing the ephemeral npm cache
+          block:
+            - ansible.builtin.command:
+                argv:
+                  - docker
+                  - compose
+                  - -f
+                  - "{{ laravel_compose_file }}"
+                  - -f
+                  - "{{ laravel_tools_override_file }}"
+                  - run
+                  - --rm
+                  - --no-deps
+                  - -T
+                  - -v
+                  - "{{ laravel_webapp_dir }}:/app"
+                  - -w
+                  - /app
+                  - --entrypoint
+                  - sh
+                  - "{{ laravel_npm_service }}"
+                  - -lc
+                  - "rm -rf /tmp/npm-cache && mkdir -p /tmp/npm-cache && npm cache clean --force && npm ci --no-audit --no-fund"
+              args:
+                chdir: "{{ laravel_project_dir }}"
+              register: laravel_npm_ci_retry
+              changed_when: true
+
+          rescue:
+            - name: Repair package-lock.json with the deployment npm runtime
+              ansible.builtin.command:
+                argv:
+                  - docker
+                  - compose
+                  - -f
+                  - "{{ laravel_compose_file }}"
+                  - -f
+                  - "{{ laravel_tools_override_file }}"
+                  - run
+                  - --rm
+                  - --no-deps
+                  - -T
+                  - -v
+                  - "{{ laravel_webapp_dir }}:/app"
+                  - -w
+                  - /app
+                  - --entrypoint
+                  - sh
+                  - "{{ laravel_npm_service }}"
+                  - -lc
+                  - >-
+                    npm install --no-save --ignore-scripts --no-audit --no-fund
+                    webpack@{{ laravel_webpack_compat_version }}
+                    webpackbar@{{ laravel_webpackbar_compat_version }}
+              args:
+                chdir: "{{ laravel_project_dir }}"
+              register: laravel_package_lock_repair
+              changed_when: true
+
+            - name: Remove node_modules after package-lock.json repair
+              ansible.builtin.file:
+                path: "{{ laravel_webapp_dir }}/node_modules"
+                state: absent
+
+            - name: Install frontend dependencies after package-lock.json repair
+              block:
+                - ansible.builtin.command:
+                    argv:
+                      - docker
+                      - compose
+                      - -f
+                      - "{{ laravel_compose_file }}"
+                      - -f
+                      - "{{ laravel_tools_override_file }}"
+                      - run
+                      - --rm
+                      - --no-deps
+                      - -T
+                      - -v
+                      - "{{ laravel_webapp_dir }}:/app"
+                      - -w
+                      - /app
+                      - --entrypoint
+                      - sh
+                      - "{{ laravel_npm_service }}"
+                      - -lc
+                      - "npm ci --no-audit --no-fund"
+                  args:
+                    chdir: "{{ laravel_project_dir }}"
+                  register: laravel_npm_ci_after_repair
+                  changed_when: true
+
+              rescue:
+                - name: Install frontend dependencies without enforcing the lock file
+                  ansible.builtin.command:
+                    argv:
+                      - docker
+                      - compose
+                      - -f
+                      - "{{ laravel_compose_file }}"
+                      - -f
+                      - "{{ laravel_tools_override_file }}"
+                      - run
+                      - --rm
+                      - --no-deps
+                      - -T
+                      - -v
+                      - "{{ laravel_webapp_dir }}:/app"
+                      - -w
+                      - /app
+                      - --entrypoint
+                      - sh
+                      - "{{ laravel_npm_service }}"
+                      - -lc
+                      - >-
+                        npm install --package-lock=false
+                        --ignore-scripts --no-audit --no-fund
+                        && SWIPER_SPEC=$(node -p "(require('./package.json').dependencies || {}).swiper || (require('./package.json').devDependencies || {}).swiper || ''")
+                        && test -n "$SWIPER_SPEC"
+                        && npm install --package-lock=false --no-save
+                        --ignore-scripts --no-audit --no-fund
+                        "swiper@$SWIPER_SPEC"
+                        && npm install --package-lock=false --no-save
+                        --ignore-scripts --no-audit --no-fund
+                        webpack@{{ laravel_webpack_compat_version }}
+                        webpackbar@{{ laravel_webpackbar_compat_version }}
+                  args:
+                    chdir: "{{ laravel_project_dir }}"
+                  register: laravel_npm_non_frozen_install
+                  changed_when: true
+
+                - name: Report non-frozen NPM fallback
+                  ansible.builtin.debug:
+                    msg: >-
+                      npm ci could not complete after automatic lock-file repair.
+                      Dependencies were installed from package.json without
+                      modifying package-lock.json. Webpack {{ laravel_webpack_compat_version }}
+                      and Webpackbar {{ laravel_webpackbar_compat_version }} were pinned
+                      for Laravel Mix.
+
+            - name: Report automatic package-lock.json repair
+              ansible.builtin.debug:
+                msg: >-
+                  package-lock.json was repaired automatically with Node
+                  {{ laravel_node_version }}, npm {{ laravel_npm_version }},
+                  Webpack {{ laravel_webpack_compat_version }}, and Webpackbar
+                  {{ laravel_webpackbar_compat_version }}.
+                  Original lock file backup: {{ laravel_package_lock_backup }}.
+
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_package_lock.stat.exists | default(false)
+
+    # npm ci follows the versions recorded in package-lock.json. Reapply the
+    # Laravel Mix-compatible webpack runtime afterward without changing the
+    # application's manifest or lock file.
+    - name: Reapply Laravel Mix compatible Webpack after npm ci
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - run
+          - --rm
+          - --no-deps
+          - -T
+          - -v
+          - "{{ laravel_webapp_dir }}:/app"
+          - -w
+          - /app
+          - --entrypoint
+          - sh
+          - "{{ laravel_npm_service }}"
+          - -lc
+          - >-
+            npm install --package-lock=false --no-save --ignore-scripts
+            --no-audit --no-fund
+            webpack@{{ laravel_webpack_compat_version }}
+            webpackbar@{{ laravel_webpackbar_compat_version }}
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_webpack_post_ci_pin
+      changed_when: true
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_package_lock.stat.exists | default(false)
+
+    - name: Read the installed Webpack version
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - run
+          - --rm
+          - --no-deps
+          - -T
+          - -v
+          - "{{ laravel_webapp_dir }}:/app"
+          - -w
+          - /app
+          - --entrypoint
+          - node
+          - "{{ laravel_npm_service }}"
+          - -p
+          - "require('webpack/package.json').version"
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_installed_webpack
+      changed_when: false
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Show installed Webpack version without changing it
+      ansible.builtin.debug:
+        msg: >-
+          Installed Webpack version after dependency normalization:
+          {{ laravel_installed_webpack.stdout | default('not detected') | trim }}.
+          package.json is preserved; package-lock.json is backed up and may be
+          normalized automatically for the legacy Laravel Mix build.
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Check the installed Swiper package manifest
+      ansible.builtin.stat:
+        path: "{{ laravel_swiper_package_json }}"
+      register: laravel_swiper_package_stat
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Require the installed Swiper package manifest
+      ansible.builtin.assert:
+        that:
+          - laravel_swiper_package_stat.stat.isreg | default(false)
+        fail_msg: >-
+          Swiper package.json was not found at
+          {{ laravel_swiper_package_json }} after frontend dependency installation.
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Add legacy Swiper bundle files to package exports
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        python3 <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        package_file = Path(os.environ["SWIPER_PACKAGE_JSON"])
+        package_dir = package_file.parent
+
+        required_files = {
+            "./swiper-bundle.min.js": "./swiper-bundle.min.js",
+            "./swiper-bundle.min.css": "./swiper-bundle.min.css",
+        }
+
+        missing_files = [
+            target
+            for target in required_files.values()
+            if not (package_dir / target.removeprefix("./")).is_file()
+        ]
+        if missing_files:
+            raise SystemExit(
+                "The requested Swiper bundle file(s) do not exist: "
+                + ", ".join(missing_files)
+            )
+
+        with package_file.open("r", encoding="utf-8") as stream:
+            package = json.load(stream)
+
+        exports = package.get("exports")
+        if exports is None:
+            exports = {}
+            package["exports"] = exports
+
+        if not isinstance(exports, dict):
+            raise SystemExit(
+                "Swiper package.json has an unsupported non-object exports field"
+            )
+
+        changed = False
+        for export_name, target in required_files.items():
+            if exports.get(export_name) != target:
+                exports[export_name] = target
+                changed = True
+
+        if not changed:
+            print("UNCHANGED")
+            raise SystemExit(0)
+
+        temporary_file = package_file.with_name(package_file.name + ".tmp")
+        with temporary_file.open("w", encoding="utf-8") as stream:
+            json.dump(package, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+
+        temporary_file.replace(package_file)
+        print("UPDATED")
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        SWIPER_PACKAGE_JSON: "{{ laravel_swiper_package_json }}"
+      register: laravel_swiper_exports_update
+      changed_when: "'UPDATED' in laravel_swiper_exports_update.stdout"
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_swiper_package_stat.stat.isreg | default(false)
+
+    - name: Verify legacy Swiper bundle exports
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        python3 <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        package_file = Path(os.environ["SWIPER_PACKAGE_JSON"])
+
+        with package_file.open("r", encoding="utf-8") as stream:
+            package = json.load(stream)
+
+        exports = package.get("exports", {})
+        expected = {
+            "./swiper-bundle.min.js": "./swiper-bundle.min.js",
+            "./swiper-bundle.min.css": "./swiper-bundle.min.css",
+        }
+
+        for export_name, target in expected.items():
+            if exports.get(export_name) != target:
+                raise SystemExit(
+                    f"Missing or invalid Swiper export: "
+                    f"{export_name} -> {target}"
+                )
+
+        print("Swiper legacy bundle exports verified.")
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        SWIPER_PACKAGE_JSON: "{{ laravel_swiper_package_json }}"
+      changed_when: false
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_swiper_package_stat.stat.isreg | default(false)
+
+    - name: Show Swiper package export correction result
+      ansible.builtin.debug:
+        msg: >-
+          Swiper package exports:
+          {{ laravel_swiper_exports_update.stdout | default('SKIPPED') | trim }}.
+          Application source files were not modified.
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Select the production frontend build script
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        python3 <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        package_file = Path(os.environ["PACKAGE_JSON"])
+
+        with package_file.open("r", encoding="utf-8") as stream:
+            package = json.load(stream)
+
+        scripts = package.get("scripts", {})
+
+        for script_name in ("production", "prod", "build"):
+            if script_name in scripts:
+                print(script_name)
+                raise SystemExit(0)
+
+        print("")
+        PY
+      args:
+        executable: /bin/bash
+      environment:
+        PACKAGE_JSON: "{{ laravel_webapp_dir }}/package.json"
+      register: laravel_npm_build_script_result
+      changed_when: false
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Store the selected frontend build script
+      ansible.builtin.set_fact:
+        laravel_npm_build_script: >-
+          {{ laravel_npm_build_script_result.stdout | default('') | trim }}
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+
+    - name: Build production frontend assets
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - run
+          - --rm
+          - --no-deps
+          - -T
+          - -v
+          - "{{ laravel_webapp_dir }}:/app"
+          - -w
+          - /app
+          - "{{ laravel_npm_service }}"
+          - run
+          - "{{ laravel_npm_build_script }}"
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_npm_build
+      changed_when: true
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_npm_build_script | default('') | length > 0
+
+    - name: Report when no production frontend build script exists
+      ansible.builtin.debug:
+        msg: >-
+          package.json has no production, prod, or build script.
+          Dependency installation completed, but the asset build was skipped.
+      when:
+        - laravel_npm_setup
+        - laravel_package_json.stat.exists
+        - laravel_npm_build_script | default('') | length == 0
+
+    - name: Report when package.json is absent
+      ansible.builtin.debug:
+        msg: >-
+          package.json was not found in {{ laravel_webapp_dir }}.
+          NPM dependency and asset-build tasks were skipped.
+      when:
+        - laravel_npm_setup
+        - not laravel_package_json.stat.exists
+
+    - name: Verify the dynamic Laravel path inside the PHP container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - test
+          - -f
+          - "{{ laravel_container_app_dir }}/artisan"
+      changed_when: false
+      register: laravel_dynamic_path_check
+      failed_when: laravel_dynamic_path_check.rc != 0
+
+    - name: Fix .env ownership inside the PHP container before writing to it
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - chown
+          - www-data:www-data
+          - "{{ laravel_container_app_dir }}/.env"
+      changed_when: true
+
+    - name: Check current APP_KEY value in .env
+      ansible.builtin.shell: >-
+        grep -m1 '^APP_KEY=' "{{ laravel_webapp_dir }}/.env" | cut -d '=' -f2-
+      args:
+        executable: /bin/bash
+      register: laravel_current_app_key
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Generate Laravel application key
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - key:generate
+          - --force
+      register: laravel_key_generate
+      changed_when: laravel_key_generate.rc == 0
+      when: laravel_current_app_key.stdout | default('') | trim | length == 0
+
+    - name: Report when APP_KEY already exists
+      ansible.builtin.debug:
+        msg: "APP_KEY already set in .env; skipping key:generate."
+      when: laravel_current_app_key.stdout | default('') | trim | length > 0
+
+    - name: Check the configured PostgreSQL Docker network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - "{{ laravel_pg_network }}"
+      register: laravel_pg_network_check
+      changed_when: false
+      when:
+        - laravel_use_db
+        - laravel_db_type | lower == 'local'
+
+    - name: Require the configured PostgreSQL Docker network
+      ansible.builtin.assert:
+        that:
+          - laravel_pg_network_check.rc == 0
+        fail_msg: >-
+          PostgreSQL Docker network '{{ laravel_pg_network }}' was not found.
+          Start or create the PostgreSQL stack on this network before deploying
+          the Laravel project.
+      when:
+        - laravel_use_db
+        - laravel_db_type | lower == 'local'
+
+    - name: Check whether PHP is attached to the PostgreSQL network
+      ansible.builtin.shell: >-
+        docker network inspect {{ laravel_pg_network | quote }}
+        --format '{{ '{{json .Containers}}' }}' |
+        grep -F {{ laravel_php_container | quote }}
+      args:
+        executable: /bin/bash
+      register: laravel_php_pg_network_membership
+      changed_when: false
+      failed_when: false
+      when:
+        - laravel_use_db
+        - laravel_db_type | lower == 'local'
+
+    - name: Attach PHP to the PostgreSQL network when missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - connect
+          - "{{ laravel_pg_network }}"
+          - "{{ laravel_php_container }}"
+      when:
+        - laravel_use_db
+        - laravel_db_type | lower == 'local'
+        - laravel_php_pg_network_membership.rc != 0
+
+    - name: Probe PostgreSQL connectivity before changing the firewall
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ laravel_php_container }}"
+          - php
+          - -r
+          - >-
+            $host = "{{ laravel_db_host }}";
+            $port = {{ laravel_db_port | int }};
+            $resolved = gethostbyname($host);
+            if ($resolved === $host) { exit(2); }
+            $socket = @fsockopen($host, $port, $errno, $error, 5);
+            if (!$socket) { exit(1); }
+            fclose($socket);
+            exit(0);
+      register: laravel_database_connectivity_probe
+      changed_when: false
+      failed_when: false
+      when:
+        - laravel_use_db
+        - laravel_db_type | lower == 'local'
+
+    - name: Read the PostgreSQL Docker network subnet when TCP access fails
+      ansible.builtin.shell: >-
+        docker network inspect {{ laravel_pg_network | quote }}
+        --format '{{ '{{(index .IPAM.Config 0).Subnet}}' }}'
+      args:
+        executable: /bin/bash
+      register: laravel_pg_network_subnet
+      changed_when: false
+      when:
+        - laravel_use_db
+        - laravel_db_type | lower == 'local'
+        - laravel_database_connectivity_probe.rc | int == 1
+
+    - name: Check the Docker firewall rule for PostgreSQL container traffic
+      ansible.builtin.command:
+        argv:
+          - iptables
+          - -C
+          - DOCKER-USER
+          - -s
+          - "{{ laravel_pg_network_subnet.stdout | trim }}"
+          - -d
+          - "{{ laravel_pg_network_subnet.stdout | trim }}"
+          - -p
+          - tcp
+          - --dport
+          - "{{ laravel_db_port | int }}"
+          - -m
+          - comment
+          - --comment
+          - laravel_allow_postgres_container_traffic
+          - -j
+          - ACCEPT
+      register: laravel_pg_firewall_rule
+      changed_when: false
+      failed_when: false
+      when:
+        - laravel_use_db
+        - laravel_db_type | lower == 'local'
+        - laravel_database_connectivity_probe.rc | int == 1
+
+    - name: Allow PHP-to-PostgreSQL traffic through the Docker firewall
+      ansible.builtin.command:
+        argv:
+          - iptables
+          - -I
+          - DOCKER-USER
+          - "1"
+          - -s
+          - "{{ laravel_pg_network_subnet.stdout | trim }}"
+          - -d
+          - "{{ laravel_pg_network_subnet.stdout | trim }}"
+          - -p
+          - tcp
+          - --dport
+          - "{{ laravel_db_port | int }}"
+          - -m
+          - comment
+          - --comment
+          - laravel_allow_postgres_container_traffic
+          - -j
+          - ACCEPT
+      when:
+        - laravel_use_db
+        - laravel_db_type | lower == 'local'
+        - laravel_database_connectivity_probe.rc | int == 1
+        - laravel_pg_firewall_rule.rc != 0
+
+    - name: Persist the Laravel PostgreSQL Docker firewall rule
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+          netfilter-persistent save
+        elif [[ -d /etc/iptables ]]; then
+          iptables-save > /etc/iptables/rules.v4
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when:
+        - laravel_use_db
+        - laravel_db_type | lower == 'local'
+        - laravel_database_connectivity_probe.rc | int == 1
+        - laravel_pg_firewall_rule.rc != 0
+
+    - name: Test PostgreSQL connectivity from PHP
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ laravel_php_container }}"
+          - php
+          - -r
+          - >-
+            $host = "{{ laravel_db_host }}";
+            $port = {{ laravel_db_port | int }};
+            $resolved = gethostbyname($host);
+            if ($resolved === $host) {
+              fwrite(STDERR, "DNS lookup failed for {$host}\\n");
+              exit(2);
+            }
+            $socket = @fsockopen($host, $port, $errno, $error, 5);
+            if (!$socket) {
+              fwrite(STDERR, "TCP connection to {$host} ({$resolved}):{$port} failed: [{$errno}] {$error}\\n");
+              exit(1);
+            }
+            fclose($socket);
+            exit(0);
+      register: laravel_database_connectivity
+      changed_when: false
+      failed_when: laravel_database_connectivity.rc != 0
+      retries: 15
+      delay: 2
+      until: laravel_database_connectivity.rc == 0
+      when:
+        - laravel_use_db
+        - laravel_db_type | lower == 'local'
+
+    - name: Ask whether to run URL-binding migrations
+      ansible.builtin.pause:
+        prompt: "Run URL-binding migrations now? (yes/no; press ENTER for yes)"
+        echo: true
+      register: laravel_url_binding_prompt
+      when: laravel_pii_setup
+
+    - name: Store URL-binding migration decision
+      ansible.builtin.set_fact:
+        laravel_run_url_binding: >-
+          {{ laravel_url_binding_prompt.user_input | default('') | trim | length == 0
+             or laravel_url_binding_prompt.user_input | lower in ['y', 'yes', 'true', '1'] }}
+      when: laravel_pii_setup
+
+    - name: Run URL-binding migrations before PII migrations
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -i
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - migrate:url-binding
+        stdin: "yes\n"
+        stdin_add_newline: false
+      register: laravel_url_binding_migrations
+      changed_when: true
+      when:
+        - laravel_pii_setup
+        - not laravel_database_empty
+        - laravel_run_url_binding
+
+    - name: Clear cached configuration before the PII configuration check
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - optimize:clear
+      changed_when: true
+      when:
+        - laravel_pii_setup
+        - not laravel_database_empty
+
+    - name: Check PII configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:check-configuration
+      register: laravel_pii_configuration_check
+      changed_when: false
+      when:
+        - laravel_pii_setup
+        - not laravel_database_empty
+
+    - name: Run base Laravel migrations for an empty database
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - migrate
+          - --force
+      register: laravel_base_migrations
+      changed_when: true
+      when:
+        - laravel_pii_setup
+        - laravel_database_empty
+
+    - name: Run URL-binding migrations after the base schema for an empty database
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -i
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - migrate:url-binding
+        stdin: "yes\n"
+        stdin_add_newline: false
+      register: laravel_empty_url_binding_migrations
+      changed_when: true
+      when:
+        - laravel_pii_setup
+        - laravel_database_empty
+        - laravel_run_url_binding
+
+    - name: Clear cached configuration after the base schema for an empty database
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - optimize:clear
+      changed_when: true
+      when:
+        - laravel_pii_setup
+        - laravel_database_empty
+
+    - name: Check PII configuration after the base schema for an empty database
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:check-configuration
+      register: laravel_empty_pii_configuration_check
+      changed_when: false
+      when:
+        - laravel_pii_setup
+        - laravel_database_empty
+
+    - name: Run PII database migrations
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - migrate:pii
+          - --force
+      register: laravel_pii_migrations
+      changed_when: true
+      when: laravel_pii_setup
+
+    - name: Seed PII owner permissions
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - db:seed
+          - --class=Database\\Seeders\\OwnerPiiPermissionsSeeder
+          - --force
+      changed_when: true
+      when: laravel_pii_setup
+
+    - name: Seed PII application permissions
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - db:seed
+          - --class=Database\\Seeders\\ApplicationPiiPermissionsSeeder
+          - --force
+      changed_when: true
+      when: laravel_pii_setup
+
+    - name: Seed PII property tax permissions
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - db:seed
+          - --class=Database\\Seeders\\PropertyTaxPiiPermissionsSeeder
+          - --force
+      changed_when: true
+      when: laravel_pii_setup
+
+    - name: Reset the permission cache after PII seeding
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - permission:cache-reset
+      changed_when: true
+      when: laravel_pii_setup
+
+    - name: Clear cached configuration after PII setup
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - optimize:clear
+      changed_when: true
+      when: laravel_pii_setup
+
+    - name: Create the PII database backup directory
+      ansible.builtin.file:
+        path: "{{ laravel_pii_db_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when:
+        - laravel_pii_setup
+        - laravel_pii_db_backup_required
+
+    - name: Back up the PostgreSQL database before PII processing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --network
+          - "{{ 'host' if laravel_db_type | lower == 'remote' else laravel_pg_network }}"
+          - --env
+          - "PGPASSWORD={{ laravel_db_password }}"
+          - -v
+          - "{{ laravel_pii_db_backup_dir }}:/backup"
+          - postgres:14
+          - pg_dump
+          - -h
+          - "{{ laravel_db_host }}"
+          - -p
+          - "{{ laravel_db_port }}"
+          - -U
+          - "{{ laravel_db_user }}"
+          - -d
+          - "{{ laravel_effective_db_name }}"
+          - -Fc
+          - -f
+          - "/backup/{{ laravel_pii_db_backup_file | basename }}"
+      register: laravel_pii_db_backup
+      changed_when: true
+      no_log: true
+      when:
+        - laravel_pii_setup
+        - laravel_pii_db_backup_required
+
+    - name: Verify the PII database backup was created
+      ansible.builtin.stat:
+        path: "{{ laravel_pii_db_backup_file }}"
+      register: laravel_pii_db_backup_stat
+      when:
+        - laravel_pii_setup
+        - laravel_pii_db_backup_required
+
+    - name: Require a non-empty PII database backup
+      ansible.builtin.assert:
+        that:
+          - laravel_pii_db_backup_stat.stat.exists
+          - laravel_pii_db_backup_stat.stat.size | int > 0
+        fail_msg: "The PostgreSQL backup was not created or is empty. PII processing has been stopped."
+      when:
+        - laravel_pii_setup
+        - laravel_pii_db_backup_required
+
+    - name: Ask whether to run the remaining PII process
+      ansible.builtin.pause:
+        prompt: >-
+          Run PII dry-run, encryption backfill, verification, disable legacy
+          plaintext, and tests? (y/n)
+        echo: true
+      register: laravel_pii_process_prompt
+      when: laravel_pii_setup
+
+    - name: Store the PII process decision
+      ansible.builtin.set_fact:
+        laravel_pii_backfill: >-
+          {{ laravel_pii_process_prompt.user_input | default('n') | lower
+             in ['y', 'yes', 'true', '1'] }}
+      when: laravel_pii_setup
+
+    - name: Dry-run encryption for existing owner PII
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:encrypt-existing-owners
+          - --dry-run
+      register: laravel_pii_owner_dry_run
+      changed_when: false
+      when: laravel_pii_backfill
+
+    - name: Dry-run encryption for existing application PII
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:encrypt-existing-applications
+          - --dry-run
+      register: laravel_pii_application_dry_run
+      changed_when: false
+      when: laravel_pii_backfill
+
+    - name: Dry-run encryption for existing property-tax PII
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:encrypt-existing-property-tax
+          - --dry-run
+      register: laravel_pii_property_tax_dry_run
+      changed_when: false
+      when: laravel_pii_backfill
+
+    - name: Encrypt existing owner PII after backup confirmation
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:encrypt-existing-owners
+      register: laravel_pii_owner_backfill
+      changed_when: true
+      no_log: true
+      when: laravel_pii_backfill
+
+    - name: Encrypt existing application PII after backup confirmation
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:encrypt-existing-applications
+      register: laravel_pii_application_backfill
+      changed_when: true
+      no_log: true
+      when: laravel_pii_backfill
+
+    - name: Encrypt existing property-tax PII after backup confirmation
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:encrypt-existing-property-tax
+      register: laravel_pii_property_tax_backfill
+      changed_when: true
+      no_log: true
+      when: laravel_pii_backfill
+
+    - name: Verify owner PII encryption
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:verify-owner-encryption
+      register: laravel_pii_owner_verification
+      changed_when: false
+      when: laravel_pii_backfill
+
+    - name: Verify application PII encryption
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:verify-application-encryption
+      register: laravel_pii_application_verification
+      changed_when: false
+      when: laravel_pii_backfill
+
+    - name: Verify property-tax PII encryption
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:verify-property-tax-encryption
+      register: laravel_pii_property_tax_verification
+      changed_when: false
+      when: laravel_pii_backfill
+
+    - name: Disable legacy plaintext PII compatibility after verification
+      ansible.builtin.lineinfile:
+        path: "{{ laravel_webapp_dir }}/.env"
+        regexp: "^PII_ALLOW_LEGACY_PLAINTEXT="
+        line: 'PII_ALLOW_LEGACY_PLAINTEXT="false"'
+        create: true
+        mode: "0640"
+      when: laravel_pii_backfill
+      no_log: true
+
+    - name: Clear cached configuration after disabling legacy plaintext
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - optimize:clear
+      changed_when: true
+      when: laravel_pii_backfill
+
+    - name: Run the final PII configuration check
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - pii:check-configuration
+      register: laravel_pii_final_configuration_check
+      changed_when: false
+      when: laravel_pii_backfill
+
+    - name: Run the PII test suite
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - test
+          - --filter=Pii
+      register: laravel_pii_tests
+      changed_when: false
+      when: laravel_pii_backfill
+
+    # `artisan storage:link` runs as the unprivileged Laravel container user.
+    # The application source is a host bind mount, so PHP cannot create the
+    # link when `public` was checked out or copied by root. Create the link on
+    # the host with Ansible instead; this uses the already-resolved dynamic
+    # source path and is idempotent regardless of the container UID.
+    - name: Ensure Laravel public directory is writable by the runtime UID
+      ansible.builtin.file:
+        path: "{{ laravel_webapp_dir }}/public"
+        state: directory
+        owner: "{{ laravel_uid }}"
+        group: "{{ laravel_gid }}"
+        mode: "0755"
+
+    - name: Create Laravel public storage link from the host
+      ansible.builtin.file:
+        src: "{{ laravel_webapp_dir }}/storage/app/public"
+        dest: "{{ laravel_webapp_dir }}/public/storage"
+        state: link
+      register: laravel_storage_link
+
+    - name: Clear Laravel optimized caches
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - php
+          - "{{ laravel_container_app_dir }}/artisan"
+          - optimize:clear
+      changed_when: true
+
+    - name: Fix Laravel runtime ownership inside the PHP container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - /
+          - "{{ laravel_php_container }}"
+          - chown
+          - -R
+          - www-data:www-data
+          - "{{ laravel_container_app_dir }}/storage"
+          - "{{ laravel_container_app_dir }}/bootstrap/cache"
+      changed_when: true
+
+    - name: Rebuild and keep all application services running
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - up
+          - -d
+          - --build
+          - --remove-orphans
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_final_compose_up
+      changed_when: true
+
+    - name: Wait for PHP after the final Compose build
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - -f
+          - "{{ '{{.State.Running}}' }}"
+          - "{{ laravel_php_container }}"
+      register: laravel_final_php_wait
+      changed_when: false
+      retries: 30
+      delay: 2
+      until:
+        - laravel_final_php_wait.rc == 0
+        - laravel_final_php_wait.stdout | trim == 'true'
+
+    - name: Verify the running PHP patch version
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ laravel_php_container }}"
+          - php
+          - -r
+          - "echo PHP_VERSION;"
+      register: laravel_runtime_php_version
+      changed_when: false
+      failed_when: laravel_runtime_php_version.stdout | trim != laravel_php_version
+
+    # Bash STEP 12 - Verification.
+    - name: Verify PHP container state
+      ansible.builtin.command:
+        argv:
+          [
+            docker,
+            inspect,
+            -f,
+            "{{ '{{.State.Running}}' }}",
+            "{{ laravel_php_container }}",
+          ]
+      changed_when: false
+      register: laravel_final_php_state
+      failed_when: false
+
+    - name: Render Laravel project configuration for shared Nginx
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/08_shared_nginx_project.conf.j2"
+        dest: "{{ laravel_shared_project_config_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      vars:
+        shared_domain: "{{ laravel_domain }}"
+        shared_nginx_app_root: "/srv/projects/{{ laravel_project_name }}/src/{{ laravel_webapp_name }}"
+        shared_php_alias: "{{ laravel_php_container }}"
+        shared_php_app_root: "{{ laravel_container_app_dir }}"
+
+    - name: Inspect shared Nginx running state
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - -f
+          - "{{ '{{.State.Running}}' }}"
+          - "{{ laravel_shared_nginx_container }}"
+      register: laravel_shared_nginx_state
+      changed_when: false
+      failed_when: false
+
+    - name: Start shared Nginx when it is stopped
+      ansible.builtin.command:
+        argv:
+          - docker
+          - start
+          - "{{ laravel_shared_nginx_container }}"
+      when:
+        - laravel_shared_nginx_state.rc == 0
+        - laravel_shared_nginx_state.stdout | trim != 'true'
+      changed_when: true
+
+    - name: Reload shared Nginx after adding the Laravel project
+      ansible.builtin.command:
+        argv:
+          - docker
+          - kill
+          - --signal
+          - HUP
+          - "{{ laravel_shared_nginx_container }}"
+      changed_when: true
+
+    - name: Verify PHP container is attached to the shared web network
+      ansible.builtin.shell: >-
+        docker network inspect {{ laravel_shared_web_network | quote }} --format '{{ '{{json .Containers}}' }}' |
+        grep -F {{ laravel_php_container | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: laravel_network_verify
+      failed_when: false
+
+    - name: Check published Compose ports
+      ansible.builtin.command: docker compose ps --format json
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      changed_when: false
+      register: laravel_compose_ps
+      failed_when: false
+
+    # Final read-only verification at the deployed shared-Nginx boundary.
+    # Laravel remains the source of truth for Content-Security-Policy and
+    # X-Frame-Options.
+    - name: Check whether shared Nginx is available for clickjacking verification
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ docker_nginx_container_name }}"
+      register: docker_nginx_container_status
+      changed_when: false
+      failed_when: false
+      when: docker_verify_clickjacking_headers | bool
+
+    - name: Require shared Nginx for clickjacking verification
+      ansible.builtin.assert:
+        that:
+          - docker_nginx_container_status.rc == 0
+        fail_msg: >-
+          Shared Nginx container {{ docker_nginx_container_name }} was not
+          found after Laravel deployment.
+      when: docker_verify_clickjacking_headers | bool
+
+    - name: Inspect effective shared Nginx clickjacking configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ docker_nginx_container_name }}"
+          - nginx
+          - -T
+      register: docker_nginx_effective_config
+      changed_when: false
+      failed_when: false
+      when: docker_verify_clickjacking_headers | bool
+
+    - name: Detect Nginx directives that compete with Laravel header ownership
+      ansible.builtin.shell: >-
+        set -o pipefail &&
+        printf '%s\n' "$NGINX_CONFIG" |
+        grep -iE
+        '(^|[[:space:];])(add_header[[:space:]]+(Content-Security-Policy|X-Frame-Options)|proxy_hide_header|more_set_headers|more_clear_headers)'
+      args:
+        executable: /bin/bash
+      environment:
+        NGINX_CONFIG: "{{ docker_nginx_effective_config.stdout | default('') }}"
+      register: docker_nginx_conflicting_directives
+      changed_when: false
+      failed_when: false
+      when: docker_verify_clickjacking_headers | bool
+
+    - name: Require shared Nginx not to override Laravel clickjacking headers
+      ansible.builtin.assert:
+        that:
+          - docker_nginx_conflicting_directives.stdout | trim == ''
+        fail_msg: >-
+          Shared Nginx contains directives that may duplicate, hide, replace,
+          or clear Laravel-owned clickjacking headers. Review the mounted
+          shared-Nginx configuration.
+        success_msg: >-
+          Shared Nginx contains no CSP/X-Frame-Options or header-manipulation
+          directives that compete with Laravel.
+      when: docker_verify_clickjacking_headers | bool
+
+    - name: Verify the final clickjacking headers from the configured URL
+      ansible.builtin.uri:
+        url: "{{ docker_clickjacking_verification_url }}"
+        method: HEAD
+        return_content: false
+        follow_redirects: safe
+        status_code: 200,301,302,303,307,308
+      register: docker_clickjacking_http_response
+      changed_when: false
+      when:
+        - docker_verify_clickjacking_headers | bool
+        - docker_clickjacking_verification_url | trim | length > 0
+
+    - name: Assert final response contains the Laravel clickjacking headers once
+      ansible.builtin.assert:
+        that:
+          - >-
+            (docker_clickjacking_http_response.headers['content-security-policy'] |
+            default('')) | trim == "frame-ancestors 'none'"
+          - >-
+            (docker_clickjacking_http_response.headers['x-frame-options'] |
+            default('')) | trim == 'DENY'
+        fail_msg: >-
+          The verified response does not match the Laravel-owned baseline:
+          Content-Security-Policy frame-ancestors 'none' and X-Frame-Options DENY.
+          Check reverse proxies and duplicate headers at every deployment layer.
+        success_msg: >-
+          Final response preserves the expected Laravel clickjacking headers.
+      when:
+        - docker_verify_clickjacking_headers | bool
+        - docker_clickjacking_verification_url | trim | length > 0
+
+    - name: Show deployment summary and next step
+      ansible.builtin.debug:
+        msg:
+          - "Project Name: {{ laravel_project_name }}"
+          - "Project Path: {{ laravel_project_dir }}"
+          - "Laravel Repo Name: {{ laravel_repo_name }}"
+          - "Laravel Source Folder: {{ laravel_webapp_name }}"
+          - "Laravel Source Path: {{ laravel_webapp_dir }}"
+          - "Domain: {{ laravel_domain }}"
+          - "PHP Container: {{ laravel_php_container }}"
+          - "Container Application Path: {{ laravel_container_app_dir }}"
+          - "PHP Runtime Version: {{ laravel_php_version }}"
+          - "PHP Runtime Version Verified: {{ laravel_runtime_php_version.stdout | default('unknown') | trim }}"
+          - "Composer PHP Runtime: {{ laravel_runtime_php_version.stdout | default('unknown') | trim }}"
+          - "Final Compose Build: completed with services kept in detached mode"
+          - "Database Enabled: {{ laravel_use_db }}"
+          - >-
+            PII Database Backup:
+            {{ laravel_pii_db_backup_file
+               if laravel_pii_setup and laravel_pii_db_backup_required
+               else 'not requested' }}
+          - >-
+            PII Follow-up Process:
+            {{ 'completed' if laravel_pii_backfill | default(false)
+               else 'skipped' }}
+          - "GeoServer Enabled: {{ laravel_use_geoserver }}"
+          - "NPM Setup Run: {{ laravel_npm_setup }}"
+          - "NPM Tool Node Version: {{ laravel_node_version }}"
+          - "NPM Tool npm Version: {{ laravel_npm_version }}"
+          - "NPM Dependency Policy: package.json is preserved; package-lock.json is generated when missing and normalized when required"
+          - "PHP running check: {{ laravel_final_php_state.stdout | default('unknown') }}"
+          - "Shared Nginx: configured and reloaded for this Laravel project"

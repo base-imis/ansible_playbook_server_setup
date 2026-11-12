@@ -1,0 +1,2211 @@
+---
+- name: Install GeoServer with the official environment-driven Docker image
+  hosts: hardening_target
+  become: true
+  # Privileged tasks still use sudo, but the login user is captured first so
+  # generated deployment files remain editable by the user who ran Ansible.
+  gather_facts: false
+
+  vars_prompt:
+    - name: gs_dir
+      prompt: "GeoServer install directory"
+      default: /home/innovative/geoserver
+      private: false
+
+    - name: gs_printing_setup_input
+      prompt: "Create the default printing config.yml if it does not exist? (yes/no)"
+      default: "yes"
+      private: false
+
+    - name: gs_printing_a4_template_src
+      prompt: "Full path to the A4 printing background template PDF"
+      private: false
+
+    - name: gs_printing_a3_template_src
+      prompt: "Full path to the A3 printing background template PDF"
+      private: false
+
+    - name: gs_version
+      prompt: "GeoServer version"
+      default: 2.28.2
+      private: false
+
+    - name: gs_container_name
+      prompt: "Container name"
+      default: geo
+      private: false
+
+    - name: gs_image_name_input
+      prompt: "Docker image name (leave blank for custom-geoserver:<version>)"
+      default: ""
+      private: false
+
+    - name: gs_host_port
+      prompt: "Localhost host port for GeoServer"
+      default: "18082"
+      private: false
+
+    - name: gs_npm_container
+      prompt: "Nginx Proxy Manager container name"
+      default: nginx-proxy-manager
+      private: false
+
+    - name: gs_workspace
+      prompt: "Primary GeoServer workspace (optional)"
+      default: ""
+      private: false
+
+    - name: gs_test_layer
+      prompt: "GeoServer layer for authenticated WMS/WFS tests (optional; workspace:layer)"
+      default: ""
+      private: false
+
+    - name: gs_skip_demo_data_input
+      prompt: "Skip GeoServer demo data on a new data directory? (yes/no)"
+      default: "yes"
+      private: false
+
+    - name: gs_install_extensions_input
+      prompt: "Install stable extensions at container startup? (yes/no)"
+      default: "yes"
+      private: false
+
+    - name: gs_extensions
+      prompt: "Stable extensions, comma-separated"
+      default: authkey,css,printing,querylayer
+      private: false
+
+    - name: gs_remove_gt_complex
+      prompt: "Remove gt-complex*.jar libraries from the image? (yes/no)"
+      default: "no"
+      private: false
+
+    - name: gs_run_uid
+      prompt: "Unprivileged GeoServer UID"
+      default: "1002"
+      private: false
+
+    - name: gs_run_gid
+      prompt: "Unprivileged GeoServer GID"
+      default: "1002"
+      private: false
+
+    - name: gs_manage_admin_credentials_input
+      prompt: "Set GeoServer administrator credentials from the container environment on this run? (yes/no)"
+      default: "yes"
+      private: false
+
+    - name: gs_admin_user
+      prompt: "GeoServer administrator username"
+      default: admin
+      private: false
+
+    - name: gs_admin_password
+      prompt: "GeoServer administrator password"
+      private: true
+      confirm: true
+
+    - name: gs_security_setup_input
+      prompt: "Automate GeoServer WMS/WFS/AuthKey security setup now? (yes/no)"
+      default: "{{ gs_default_security_setup }}"
+      private: false
+
+    - name: gs_service_user_input
+      prompt: "GeoServer OGC service username"
+      default: "{{ gs_default_service_user }}"
+      private: false
+
+    - name: gs_service_password_input
+      prompt: "Password for the GeoServer OGC service user"
+      default: ""
+      private: true
+      confirm: true
+
+    - name: gs_service_role_input
+      prompt: "GeoServer OGC service role"
+      default: "{{ gs_default_service_role }}"
+      private: false
+
+    - name: gs_db_network
+      prompt: "Docker network used by PostgreSQL"
+      default: postgres14_backend
+      private: false
+
+    - name: gs_memory_limit
+      prompt: "Container memory limit"
+      default: 2g
+      private: false
+
+    - name: gs_memory_reservation
+      prompt: "Container memory reservation"
+      default: 512m
+      private: false
+
+    - name: gs_jvm_xmx
+      prompt: "JVM heap maximum"
+      default: 1536m
+      private: false
+
+    - name: gs_cpu_limit
+      prompt: "Container CPU limit"
+      default: "2.0"
+      private: false
+
+    - name: gs_backup_data_input
+      prompt: "Back up an existing GeoServer data directory before deployment? (yes/no)"
+      default: "yes"
+      private: false
+
+    - name: gs_pause_input
+      prompt: "Pause at the local Nginx checkpoint? (yes/no)"
+      default: "yes"
+      private: false
+
+  vars:
+    gs_proxy_network: geoserver_proxy
+    # Local-only deployment. Nginx may proxy /geoserver locally, but no public
+    # DNS name, public HTTPS endpoint, or Cloudflare endpoint is required.
+    gs_domain: localhost
+    gs_default_security_setup: "yes"
+    gs_default_service_user: geoserver_service_user
+    gs_default_service_role: ROLE_GEOSERVER_SERVICE
+    # These values must match the service user, role, and URL parameter created
+    # in GeoServer Security.  The AuthKey itself is generated by GeoServer and
+    # is intentionally never written to this playbook or displayed in output.
+    gs_service_user: geoserver_service_user
+    gs_service_role: ROLE_GEOSERVER_SERVICE
+    gs_authkey_parameter: authkey
+    gs_yes_values: ["yes", "y", "true", "1"]
+    gs_cors_allowed_methods: GET,POST,PUT,DELETE,HEAD,OPTIONS
+    gs_cors_allowed_headers: >-
+      Origin,Accept,X-Requested-With,Content-Type,Access-Control-Request-Method,
+      Access-Control-Request-Headers,Authorization
+
+  pre_tasks:
+    - name: Gather facts as the Ansible login user
+      ansible.builtin.setup:
+      become: false
+
+    - name: Record the Ansible login user for editable deployment files
+      ansible.builtin.set_fact:
+        gs_deploy_user: "{{ ansible_user_id }}"
+      become: false
+
+    - name: Require a non-root Ansible login user
+      ansible.builtin.assert:
+        that:
+          - gs_deploy_user != 'root'
+        fail_msg: >-
+          Run this playbook as the normal SSH/login user that has sudo access,
+          not with sudo or as root. The playbook will escalate only the tasks
+          that require system privileges.
+      become: false
+
+    - name: Normalize GeoServer input values
+      ansible.builtin.set_fact:
+        gs_image_name: >-
+          {{
+            gs_image_name_input
+            if gs_image_name_input | trim | length > 0
+            else 'custom-geoserver:' + gs_version
+          }}
+        gs_printing_config_src: >-
+          {{ gs_dir + '/geoserver_data/config.yml' }}
+        gs_printing_setup: >-
+          {{ gs_printing_setup_input | trim | lower in gs_yes_values }}
+        gs_security_setup: >-
+          {{
+            (
+              gs_security_setup_input | trim
+              if gs_security_setup_input | trim | length > 0
+              else gs_default_security_setup
+            ) | lower in gs_yes_values
+          }}
+        gs_service_user: >-
+          {{
+            gs_service_user_input | trim
+            if gs_service_user_input | trim | length > 0
+            else gs_default_service_user
+          }}
+        gs_service_role: >-
+          {{
+            gs_service_role_input | trim
+            if gs_service_role_input | trim | length > 0
+            else gs_default_service_role
+          }}
+        gs_extension_csv: "{{ gs_extensions | regex_replace('\\s+', '') }}"
+        gs_effective_cors_origins: "http://localhost"
+        gs_skip_demo_data: >-
+          {{ gs_skip_demo_data_input | trim | lower in gs_yes_values }}
+        gs_install_extensions: >-
+          {{ gs_install_extensions_input | trim | lower in gs_yes_values }}
+        gs_remove_gt_complex_enabled: >-
+          {{ gs_remove_gt_complex | trim | lower in gs_yes_values }}
+        gs_manage_admin_credentials: >-
+          {{ gs_manage_admin_credentials_input | trim | lower in gs_yes_values }}
+        gs_backup_data: >-
+          {{ gs_backup_data_input | trim | lower in gs_yes_values }}
+        gs_pause: >-
+          {{ gs_pause_input | trim | lower in gs_yes_values }}
+        gs_extra_java_opts: >-
+          -Xms1g -Xmx{{ gs_jvm_xmx }} -XX:+UseContainerSupport
+          -XX:MaxRAMPercentage=75.0 -XX:+UseG1GC
+          -XX:MaxGCPauseMillis=100
+          -Dgeoserver.xframe.options.enabled=true
+          -Dorg.geotools.referencing.forceXY=true
+          -Dgeoserver.csp.formAction=http://{{ gs_domain }}
+
+    - name: Validate GeoServer input values
+      ansible.builtin.assert:
+        that:
+          - gs_dir.startswith('/')
+          # Accept the default path or any custom absolute installation path.
+          # The exclusions below still prevent deployment over a system root.
+          - gs_dir | trim | length > 0
+          - gs_dir not in ['/', '/home', '/opt', '/var', '/usr', '/root', '/home/innovative']
+          - gs_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')
+          - gs_container_name is match('^[A-Za-z_][A-Za-z0-9_.-]*$')
+          - gs_host_port | int >= 1
+          - gs_host_port | int <= 65535
+          - gs_domain in ['localhost', '127.0.0.1']
+          - gs_db_network | trim | length > 0
+          - gs_service_user is match('^[A-Za-z_][A-Za-z0-9_.-]*$')
+          - gs_service_role is match('^[A-Za-z_][A-Za-z0-9_.-]*$')
+          - gs_authkey_parameter is match('^[A-Za-z_][A-Za-z0-9_.-]*$')
+          - gs_run_uid | int >= 1
+          - gs_run_uid | int <= 60000
+          - gs_run_gid | int >= 1
+          - gs_run_gid | int <= 60000
+          - gs_extension_csv is match('^$|^[a-z0-9][a-z0-9_-]*(,[a-z0-9][a-z0-9_-]*)*$')
+          - gs_remove_gt_complex | trim | lower in ['yes', 'no', 'y', 'n', 'true', 'false', '1', '0']
+          - gs_skip_demo_data_input | trim | lower in ['yes', 'no', 'y', 'n', 'true', 'false', '1', '0']
+          - gs_install_extensions_input | trim | lower in ['yes', 'no', 'y', 'n', 'true', 'false', '1', '0']
+          - gs_manage_admin_credentials_input | trim | lower in ['yes', 'no', 'y', 'n', 'true', 'false', '1', '0']
+          - gs_backup_data_input | trim | lower in ['yes', 'no', 'y', 'n', 'true', 'false', '1', '0']
+          - gs_pause_input | trim | lower in ['yes', 'no', 'y', 'n', 'true', 'false', '1', '0']
+          - not gs_manage_admin_credentials or (gs_admin_user | length > 0)
+          - not gs_manage_admin_credentials or (gs_admin_password | length >= 12)
+          - "'\\n' not in gs_admin_password"
+          - "'\\r' not in gs_admin_password"
+          - not gs_security_setup or (gs_service_user | length > 0)
+          - not gs_security_setup or (gs_service_role | length > 0)
+          - not gs_security_setup or (gs_service_password_input | length >= 12)
+          - not gs_security_setup or gs_service_user is match('^[A-Za-z_][A-Za-z0-9_.-]*$')
+          - not gs_security_setup or gs_service_role is match('^[A-Za-z_][A-Za-z0-9_.-]*$')
+        fail_msg: >-
+          One or more GeoServer inputs are invalid. Use an absolute custom
+          installation path for gs_dir (for example /srv/baseimis-geoserver),
+          and ensure the administrator password contains at least 12 characters.
+
+  tasks:
+    - name: Install GeoServer deployment prerequisites
+      ansible.builtin.apt:
+        name:
+          - curl
+          - dnsutils
+          - python3
+          - tar
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Verify Docker is installed
+      ansible.builtin.command: docker --version
+      changed_when: false
+
+    - name: Enable and start Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Verify Docker Compose plugin
+      ansible.builtin.command: docker compose version
+      changed_when: false
+
+    - name: Create GeoServer base directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {
+            path: "{{ gs_dir }}",
+            owner: "{{ gs_deploy_user }}",
+            group: root,
+            mode: "0755",
+          }
+        - {
+            path: "{{ gs_dir }}/backups",
+            owner: "{{ gs_deploy_user }}",
+            group: root,
+            mode: "0750",
+          }
+        - {
+            path: "{{ gs_dir }}/config_overrides",
+            owner: "{{ gs_deploy_user }}",
+            group: root,
+            mode: "0755",
+          }
+        - {
+            path: "{{ gs_dir }}/geoserver_data",
+            owner: "{{ gs_run_uid }}",
+            group: "{{ gs_run_gid }}",
+            mode: "0750",
+          }
+        - {
+            path: "{{ gs_dir }}/geoserver_data/printing",
+            owner: "{{ gs_run_uid }}",
+            group: "{{ gs_run_gid }}",
+            mode: "0750",
+          }
+        - {
+            path: "{{ gs_dir }}/geoserver_data/printing/templates",
+            owner: "{{ gs_run_uid }}",
+            group: "{{ gs_run_gid }}",
+            mode: "0750",
+          }
+        - {
+            path: "{{ gs_dir }}/additional_libs",
+            owner: "{{ gs_run_uid }}",
+            group: "{{ gs_run_gid }}",
+            mode: "0750",
+          }
+        - {
+            path: "{{ gs_dir }}/additional_fonts",
+            owner: "{{ gs_run_uid }}",
+            group: "{{ gs_run_gid }}",
+            mode: "0750",
+          }
+
+    - name: Check GeoServer printing configuration source
+      ansible.builtin.stat:
+        path: "{{ gs_printing_config_src }}"
+      register: gs_printing_config_file
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+
+    - name: Create default GeoServer printing configuration when missing
+      ansible.builtin.copy:
+        dest: "{{ gs_printing_config_src }}"
+        owner: "{{ gs_run_uid }}"
+        group: "{{ gs_run_gid }}"
+        mode: "0640"
+        force: false
+        content: |
+          dpis:
+            - 75
+            - 150
+            - 200
+
+          scales:
+            - 500
+            - 1000
+            - 2000
+            - 5000
+            - 10000
+            - 20000
+            - 25000
+            - 50000
+            - 75000
+            - 100000
+
+          hosts:
+            - !localMatch
+              dummy: true
+            - !dnsMatch
+              host: localhost
+              port: 8080
+            - !dnsMatch
+              host: 127.0.0.1
+              port: 8080
+            - !dnsMatch
+              host: localhost
+              port: 80
+
+          layouts:
+            A4 Portrait:
+              metaData:
+                title: '${mapTitle}'
+                author: 'IMIS'
+                subject: 'Map print'
+                keywords: 'map,print'
+                creator: 'MapFish'
+              mainPage:
+                pageSize: A4
+                rotation: true
+                backgroundPdf: templates/A4_Landscape.pdf
+                items:
+                  - !text
+                    text: '${mapTitle}'
+                    fontSize: 24
+                    spacingAfter: 20
+                  - !map
+                    spacingAfter: 20
+                    width: 440
+                    height: 483
+                  - !text
+                    font: Helvetica
+                    fontSize: 9
+                    align: right
+                    text: '1:${scale} ${now MM.dd.yyyy}'
+
+            A3 Portrait:
+              metaData:
+                title: '${mapTitle}'
+                author: 'IMIS'
+                subject: 'Map print'
+                keywords: 'map,print'
+                creator: 'MapFish'
+              mainPage:
+                pageSize: A3
+                rotation: true
+                backgroundPdf: templates/A3_Landscape.pdf
+                items:
+                  - !text
+                    text: '${mapTitle}'
+                    fontSize: 24
+                    spacingAfter: 20
+                  - !map
+                    spacingAfter: 20
+                    width: 700
+                    height: 500
+                  - !text
+                    text: '${comment}'
+                    spacingAfter: 20
+                  - !text
+                    font: Helvetica
+                    fontSize: 9
+                    align: right
+                    text: '1:${scale} ${now MM.dd.yyyy}'
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+        - gs_printing_setup
+        - not gs_printing_config_file.stat.exists
+
+    - name: Recheck GeoServer printing configuration source
+      ansible.builtin.stat:
+        path: "{{ gs_printing_config_src }}"
+      register: gs_printing_config_file_after_create
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+
+    - name: Check A4 printing background template
+      ansible.builtin.stat:
+        path: "{{ gs_printing_a4_template_src }}"
+      register: gs_printing_a4_template_file
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+
+    - name: Check A3 printing background template
+      ansible.builtin.stat:
+        path: "{{ gs_printing_a3_template_src }}"
+      register: gs_printing_a3_template_file
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+
+    - name: Require A4 and A3 printing background templates
+      ansible.builtin.assert:
+        that:
+          - gs_printing_a4_template_file.stat.exists
+          - gs_printing_a4_template_file.stat.isreg
+          - gs_printing_a3_template_file.stat.exists
+          - gs_printing_a3_template_file.stat.isreg
+        fail_msg: >-
+          Both A4 and A3 printing background PDF templates must exist. Check
+          the paths entered for the A4 and A3 printing templates.
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+
+    - name: Install A4 printing background template
+      ansible.builtin.copy:
+        src: "{{ gs_printing_a4_template_src }}"
+        dest: "{{ gs_dir }}/geoserver_data/printing/templates/A4_Landscape.pdf"
+        owner: "{{ gs_run_uid }}"
+        group: "{{ gs_run_gid }}"
+        mode: "0640"
+        force: true
+        remote_src: true
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+
+    - name: Install A3 printing background template
+      ansible.builtin.copy:
+        src: "{{ gs_printing_a3_template_src }}"
+        dest: "{{ gs_dir }}/geoserver_data/printing/templates/A3_Landscape.pdf"
+        owner: "{{ gs_run_uid }}"
+        group: "{{ gs_run_gid }}"
+        mode: "0640"
+        force: true
+        remote_src: true
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+
+    - name: Require GeoServer printing configuration source
+      ansible.builtin.assert:
+        that:
+          - gs_printing_config_file_after_create.stat.exists
+          - gs_printing_config_file_after_create.stat.isreg
+        fail_msg: >-
+          Could not find the GeoServer printing template at
+          {{ gs_printing_config_src }}. Set printing setup to yes or create
+          config.yml at that path.
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+
+    - name: Render GeoServer printing configuration
+      ansible.builtin.copy:
+        src: "{{ gs_printing_config_src }}"
+        dest: "{{ gs_dir }}/geoserver_data/printing/config.yaml"
+        owner: "{{ gs_run_uid }}"
+        group: "{{ gs_run_gid }}"
+        mode: "0640"
+        force: true
+        remote_src: true
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+
+    - name: Create protected GeoServer credential directory
+      ansible.builtin.file:
+        path: "{{ gs_dir }}/secrets"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: gs_manage_admin_credentials
+
+    - name: Download pinned MapFish printing runtime dependencies
+      ansible.builtin.get_url:
+        url: "{{ item.url }}"
+        dest: "{{ gs_dir }}/additional_libs/{{ item.name }}"
+        owner: "{{ gs_run_uid }}"
+        group: "{{ gs_run_gid }}"
+        mode: "0644"
+        checksum: "{{ item.checksum }}"
+      loop:
+        - name: jackson-dataformat-yaml-2.19.0.jar
+          url: https://repo1.maven.org/maven2/com/fasterxml/jackson/dataformat/jackson-dataformat-yaml/2.19.0/jackson-dataformat-yaml-2.19.0.jar
+          checksum: sha1:https://repo1.maven.org/maven2/com/fasterxml/jackson/dataformat/jackson-dataformat-yaml/2.19.0/jackson-dataformat-yaml-2.19.0.jar.sha1
+        - name: snakeyaml-2.3.jar
+          url: https://repo1.maven.org/maven2/org/yaml/snakeyaml/2.3/snakeyaml-2.3.jar
+          checksum: sha1:https://repo1.maven.org/maven2/org/yaml/snakeyaml/2.3/snakeyaml-2.3.jar.sha1
+        - name: commons-httpclient-3.1.jar
+          url: https://repo1.maven.org/maven2/commons-httpclient/commons-httpclient/3.1/commons-httpclient-3.1.jar
+          checksum: sha1:https://repo1.maven.org/maven2/commons-httpclient/commons-httpclient/3.1/commons-httpclient-3.1.jar.sha1
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+      no_log: true
+
+    - name: Verify pinned MapFish printing runtime dependencies are present
+      ansible.builtin.shell: |
+        set -euo pipefail
+        libs_dir={{ (gs_dir + '/additional_libs') | quote }}
+        for jar in \
+          jackson-dataformat-yaml-2.19.0.jar \
+          snakeyaml-2.3.jar \
+          commons-httpclient-3.1.jar; do
+          test -f "$libs_dir/$jar"
+        done
+      args:
+        executable: /bin/bash
+      when:
+        - gs_install_extensions
+        - "'printing' in gs_extension_csv.split(',')"
+      changed_when: false
+
+    - name: Write GeoServer administrator username secret
+      ansible.builtin.copy:
+        dest: "{{ gs_dir }}/secrets/geoserver_admin_user"
+        content: "{{ gs_admin_user }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: gs_manage_admin_credentials
+      no_log: true
+
+    - name: Write GeoServer administrator password secret
+      ansible.builtin.copy:
+        dest: "{{ gs_dir }}/secrets/geoserver_admin_password"
+        content: "{{ gs_admin_password }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: gs_manage_admin_credentials
+      no_log: true
+
+    - name: Remove administrator secret files when credential management is disabled
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ gs_dir }}/secrets/geoserver_admin_user"
+        - "{{ gs_dir }}/secrets/geoserver_admin_password"
+      when: not gs_manage_admin_credentials
+      no_log: true
+
+    - name: Check for data directory from the previous compose layout
+      ansible.builtin.stat:
+        path: "{{ gs_dir }}/data/global.xml"
+      register: gs_old_data_global
+
+    - name: Check whether the new data directory is initialized
+      ansible.builtin.stat:
+        path: "{{ gs_dir }}/geoserver_data/global.xml"
+      register: gs_new_data_global_before
+
+    - name: Migrate the previous data directory to the new layout
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cp -a {{ (gs_dir + '/data/.') | quote }} {{ (gs_dir + '/geoserver_data/') | quote }}
+      args:
+        executable: /bin/bash
+      when:
+        - gs_old_data_global.stat.exists
+        - not gs_new_data_global_before.stat.exists
+      changed_when: true
+
+    - name: Explain which data directory is used when both layouts exist
+      ansible.builtin.debug:
+        msg: >-
+          Both {{ gs_dir }}/data and {{ gs_dir }}/geoserver_data are initialized.
+          The new compose file uses only {{ gs_dir }}/geoserver_data. The old
+          data directory has not been changed.
+      when:
+        - gs_old_data_global.stat.exists
+        - gs_new_data_global_before.stat.exists
+
+    - name: Apply ownership to writable GeoServer data
+      ansible.builtin.file:
+        path: "{{ gs_dir }}/geoserver_data"
+        state: directory
+        owner: "{{ gs_run_uid }}"
+        group: "{{ gs_run_gid }}"
+        mode: "0750"
+        recurse: true
+
+    - name: Recheck whether GeoServer data is initialized after migration
+      ansible.builtin.stat:
+        path: "{{ gs_dir }}/geoserver_data/global.xml"
+      register: gs_data_initialized_before
+
+    - name: Back up the existing GeoServer data directory
+      ansible.builtin.command:
+        argv:
+          - tar
+          - -C
+          - "{{ gs_dir }}"
+          - -czf
+          - "{{ gs_dir }}/backups/geoserver_data-{{ ansible_date_time.iso8601_basic_short }}.tar.gz"
+          - geoserver_data
+      when:
+        - gs_backup_data
+        - gs_data_initialized_before.stat.exists
+      changed_when: true
+
+    - name: Write GeoServer wrapper Dockerfile from the official GeoServer image
+      ansible.builtin.copy:
+        dest: "{{ gs_dir }}/Dockerfile"
+        owner: "{{ gs_deploy_user }}"
+        group: root
+        mode: "0644"
+        backup: true
+        content: |
+          ARG GS_VERSION={{ gs_version }}
+          FROM docker.osgeo.org/geoserver:${GS_VERSION}
+
+          ARG REMOVE_GT_COMPLEX=false
+
+          USER root
+
+          RUN set -eux; \
+              remove_gt_complex="$(printf '%s' "${REMOVE_GT_COMPLEX}" | tr '[:upper:]' '[:lower:]')"; \
+              case "${remove_gt_complex}" in \
+                yes|true|1) \
+                  find "${CATALINA_HOME}/webapps/geoserver/WEB-INF/lib" \
+                    -maxdepth 1 -type f -name 'gt-complex*.jar' -delete; \
+                  ;; \
+                no|false|0) \
+                  :; \
+                  ;; \
+                *) \
+                  echo "REMOVE_GT_COMPLEX must be yes/no, true/false, or 1/0" >&2; \
+                  exit 1; \
+                  ;; \
+              esac
+
+          # Keep the official image entrypoint/startup logic.  The container
+          # starts as root only long enough for startup.sh to prepare mounted
+          # folders and then drops to RUN_WITH_USER_UID/RUN_WITH_USER_GID when
+          # RUN_UNPRIVILEGED=true is supplied by Compose.
+
+    - name: Write minimal Docker build context ignore file
+      ansible.builtin.copy:
+        dest: "{{ gs_dir }}/.dockerignore"
+        owner: "{{ gs_deploy_user }}"
+        group: root
+        mode: "0644"
+        content: |
+          *
+          !Dockerfile
+
+    - name: Write GeoServer environment file
+      ansible.builtin.copy:
+        dest: "{{ gs_dir }}/.env"
+        owner: "{{ gs_deploy_user }}"
+        group: root
+        mode: "0600"
+        backup: false
+        content: |
+          GS_VERSION={{ gs_version }}
+          GS_IMAGE_NAME={{ gs_image_name }}
+          GS_CONTAINER_NAME={{ gs_container_name }}
+          GS_BIND_ADDRESS=127.0.0.1
+          GS_HOST_PORT={{ gs_host_port }}
+          GS_PROXY_NETWORK={{ gs_proxy_network }}
+          GS_DB_NETWORK={{ gs_db_network }}
+          GS_REMOVE_GT_COMPLEX={{ 'true' if gs_remove_gt_complex_enabled else 'false' }}
+          GS_SKIP_DEMO_DATA={{ 'true' if gs_skip_demo_data else 'false' }}
+          GS_INSTALL_EXTENSIONS={{ 'true' if gs_install_extensions else 'false' }}
+          GS_STABLE_EXTENSIONS={{ gs_extension_csv }}
+          GS_EXTRA_JAVA_OPTS={{ gs_extra_java_opts | to_json }}
+          GS_RUN_UNPRIVILEGED=true
+          GS_RUN_WITH_USER_UID={{ gs_run_uid }}
+          GS_RUN_WITH_USER_GID={{ gs_run_gid }}
+          GS_PROXY_BASE_URL={{ ('http://' + gs_domain + '/geoserver') | to_json }}
+          GS_PROXY_BASE_URL_HEADERS=true
+          GS_CSRF_WHITELIST={{ gs_domain }}
+          GS_CSP_STRICT=false
+          GS_ROOT_WEBAPP_REDIRECT=true
+          GS_CORS_ENABLED=true
+          GS_CORS_ALLOWED_METHODS={{ gs_cors_allowed_methods | to_json }}
+          GS_CORS_ALLOWED_HEADERS={{ gs_cors_allowed_headers | to_json }}
+          GS_CORS_ALLOWED_ORIGINS={{ gs_effective_cors_origins | to_json }}
+          GS_CORS_ALLOW_CREDENTIALS=true
+          GS_CPU_LIMIT={{ gs_cpu_limit }}
+          GS_MEMORY_LIMIT={{ gs_memory_limit }}
+          GS_MEMORY_RESERVATION={{ gs_memory_reservation }}
+      no_log: true
+
+    - name: Write GeoServer Compose file for the official image
+      ansible.builtin.copy:
+        dest: "{{ gs_dir }}/docker-compose.yml"
+        owner: "{{ gs_deploy_user }}"
+        group: root
+        mode: "0644"
+        backup: true
+        content: |
+          services:
+            geoserver:
+              build:
+                context: .
+                dockerfile: Dockerfile
+                args:
+                  GS_VERSION: "${GS_VERSION}"
+                  REMOVE_GT_COMPLEX: "${GS_REMOVE_GT_COMPLEX}"
+              image: "${GS_IMAGE_NAME}"
+              container_name: "${GS_CONTAINER_NAME}"
+              restart: unless-stopped
+
+              ports:
+                - "${GS_BIND_ADDRESS}:${GS_HOST_PORT}:8080"
+
+              environment:
+                GEOSERVER_DATA_DIR: /opt/geoserver_data
+                SKIP_DEMO_DATA: "${GS_SKIP_DEMO_DATA}"
+                INSTALL_EXTENSIONS: "${GS_INSTALL_EXTENSIONS}"
+                STABLE_EXTENSIONS: "${GS_STABLE_EXTENSIONS}"
+                EXTRA_JAVA_OPTS: "${GS_EXTRA_JAVA_OPTS}"
+                RUN_UNPRIVILEGED: "${GS_RUN_UNPRIVILEGED}"
+                RUN_WITH_USER_UID: "${GS_RUN_WITH_USER_UID}"
+                RUN_WITH_USER_GID: "${GS_RUN_WITH_USER_GID}"
+                CHANGE_OWNERSHIP_ON_FOLDERS: "/opt/geoserver_data"
+                PROXY_BASE_URL: "${GS_PROXY_BASE_URL}"
+                PROXY_BASE_URL_HEADERS: "${GS_PROXY_BASE_URL_HEADERS}"
+                GEOSERVER_CSRF_WHITELIST: "${GS_CSRF_WHITELIST}"
+                "org.geoserver.web.csp.strict": "${GS_CSP_STRICT}"
+                ROOT_WEBAPP_REDIRECT: "${GS_ROOT_WEBAPP_REDIRECT}"
+                CORS_ENABLED: "${GS_CORS_ENABLED}"
+                CORS_ALLOWED_METHODS: "${GS_CORS_ALLOWED_METHODS}"
+                CORS_ALLOWED_HEADERS: "${GS_CORS_ALLOWED_HEADERS}"
+                CORS_ALLOWED_ORIGINS: "${GS_CORS_ALLOWED_ORIGINS}"
+                CORS_ALLOW_CREDENTIALS: "${GS_CORS_ALLOW_CREDENTIALS}"
+          {% if gs_manage_admin_credentials %}
+                GEOSERVER_ADMIN_USER_FILE: /run/secrets/geoserver_admin_user
+                GEOSERVER_ADMIN_PASSWORD_FILE: /run/secrets/geoserver_admin_password
+          {% endif %}
+
+              volumes:
+                - ./geoserver_data:/opt/geoserver_data:rw
+                - ./config_overrides:/opt/config_overrides:ro
+                - ./additional_libs:/opt/additional_libs:rw
+                - ./additional_fonts:/opt/additional_fonts:ro
+          {% if gs_manage_admin_credentials %}
+                - ./secrets/geoserver_admin_user:/run/secrets/geoserver_admin_user:ro
+                - ./secrets/geoserver_admin_password:/run/secrets/geoserver_admin_password:ro
+          {% endif %}
+
+              security_opt:
+                - no-new-privileges:true
+
+              cpus: "${GS_CPU_LIMIT}"
+              mem_limit: "${GS_MEMORY_LIMIT}"
+              mem_reservation: "${GS_MEMORY_RESERVATION}"
+
+              logging:
+                driver: json-file
+                options:
+                  max-size: "10m"
+                  max-file: "3"
+
+              networks:
+                geoserver_internal:
+                geoserver_proxy:
+                  aliases:
+                    - "${GS_CONTAINER_NAME}"
+                database_network:
+
+          networks:
+            geoserver_internal:
+              name: "${GS_CONTAINER_NAME}_internal"
+              driver: bridge
+            geoserver_proxy:
+              external: true
+              name: "${GS_PROXY_NETWORK}"
+            database_network:
+              external: true
+              name: "${GS_DB_NETWORK}"
+
+    - name: Verify generated Dockerfile uses the official GeoServer image
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -Fq
+          - "FROM docker.osgeo.org/geoserver:${GS_VERSION}"
+          - "{{ gs_dir }}/Dockerfile"
+      changed_when: false
+
+    - name: Inspect GeoServer proxy network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - "{{ gs_proxy_network }}"
+      register: gs_network_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Create GeoServer proxy network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - create
+          - "{{ gs_proxy_network }}"
+      when: gs_network_inspect.rc != 0
+      changed_when: true
+
+    - name: Inspect PostgreSQL Docker network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - "{{ gs_db_network }}"
+      register: gs_db_network_inspect
+      changed_when: false
+      failed_when: false
+
+    - name: Require PostgreSQL Docker network to exist
+      ansible.builtin.assert:
+        that:
+          - gs_db_network_inspect.rc == 0
+        fail_msg: >-
+          PostgreSQL Docker network '{{ gs_db_network }}' does not exist.
+          Check the available Docker networks using: docker network ls
+
+    - name: Verify NPM container is running
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - -f
+          - "{% raw %}{{.State.Running}}{% endraw %}"
+          - "{{ gs_npm_container }}"
+      register: gs_npm_running
+      changed_when: false
+      failed_when: gs_npm_running.stdout | trim != 'true'
+
+    - name: Check whether NPM is connected to the GeoServer proxy network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - inspect
+          - --format
+          - "{% raw %}{{json .Containers}}{% endraw %}"
+          - "{{ gs_proxy_network }}"
+      register: gs_proxy_network_containers
+      changed_when: false
+
+    - name: Connect NPM to the GeoServer proxy network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - network
+          - connect
+          - "{{ gs_proxy_network }}"
+          - "{{ gs_npm_container }}"
+      when: gs_npm_container not in gs_proxy_network_containers.stdout
+      changed_when: true
+
+    - name: Validate GeoServer Compose configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - --env-file
+          - .env
+          - config
+          - --quiet
+      args:
+        chdir: "{{ gs_dir }}"
+      changed_when: false
+      no_log: true
+
+    - name: Build the GeoServer wrapper image from the official GeoServer base
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - --env-file
+          - .env
+          - build
+          - --pull
+      args:
+        chdir: "{{ gs_dir }}"
+      register: gs_build
+      changed_when: true
+
+    - name: Verify the selected GeoServer image supports unprivileged execution
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --entrypoint
+          - sh
+          - "{{ gs_image_name }}"
+          - -lc
+          - >-
+            grep -q 'RUN_UNPRIVILEGED' /opt/startup.sh
+            && grep -q 'RUN_WITH_USER_UID' /opt/startup.sh
+            && grep -q 'RUN_WITH_USER_GID' /opt/startup.sh
+            && grep -q 'setpriv' /opt/startup.sh
+            && command -v setpriv >/dev/null 2>&1
+      register: gs_unprivileged_image_check
+      changed_when: false
+      failed_when: false
+
+    - name: Require GeoServer image support for unprivileged execution
+      ansible.builtin.assert:
+        that:
+          - gs_unprivileged_image_check.rc == 0
+        fail_msg: >-
+          The built wrapper image does not contain the official GeoServer
+          unprivileged startup logic. Confirm that docker.osgeo.org/geoserver:{{ gs_version }}
+          was pulled successfully and review the preceding image-build output.
+
+    - name: Start or recreate GeoServer
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - --env-file
+          - .env
+          - up
+          - -d
+          - --force-recreate
+          - --remove-orphans
+      args:
+        chdir: "{{ gs_dir }}"
+      register: gs_up
+      changed_when: >-
+        'Started' in gs_up.stdout
+        or 'Created' in gs_up.stdout
+        or 'Recreated' in gs_up.stdout
+        or 'Creating' in gs_up.stdout
+        or 'Starting' in gs_up.stdout
+
+    - name: Verify GeoServer joined the PostgreSQL Docker network
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ gs_container_name }}"
+          - --format
+          - "{% raw %}{{range $name, $config := .NetworkSettings.Networks}}{{println $name}}{{end}}{% endraw %}"
+      register: gs_container_networks
+      changed_when: false
+
+    - name: Require GeoServer PostgreSQL network attachment
+      ansible.builtin.assert:
+        that:
+          - gs_db_network in gs_container_networks.stdout_lines
+        fail_msg: >-
+          GeoServer is not attached to PostgreSQL Docker network '{{ gs_db_network }}'.
+          Check the generated Compose file and the external network name.
+
+    - name: Read the effective GeoServer container environment
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "{{ gs_container_name }}"
+          - --format
+          - "{% raw %}{{range .Config.Env}}{{println .}}{{end}}{% endraw %}"
+      register: gs_effective_environment
+      changed_when: false
+
+    - name: Validate GeoServer reverse proxy environment
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('PROXY_BASE_URL=http://' + gs_domain + '/geoserver')
+            in gs_effective_environment.stdout_lines
+          - "'PROXY_BASE_URL_HEADERS=true' in gs_effective_environment.stdout_lines"
+          - >-
+            ('GEOSERVER_CSRF_WHITELIST=' + gs_domain)
+            in gs_effective_environment.stdout_lines
+          - "'org.geoserver.web.csp.strict=false' in gs_effective_environment.stdout_lines"
+        fail_msg: >-
+          The running GeoServer container is missing the expected local reverse-proxy/CSP
+          environment. PROXY_BASE_URL must point to the local HTTP GeoServer URL,
+          PROXY_BASE_URL_HEADERS must be true, GEOSERVER_CSRF_WHITELIST must match
+          localhost, and org.geoserver.web.csp.strict must be false.
+
+    - name: Validate the effective unprivileged environment
+      ansible.builtin.assert:
+        that:
+          - "'RUN_UNPRIVILEGED=true' in gs_effective_environment.stdout_lines"
+          - >-
+            ('RUN_WITH_USER_UID=' + (gs_run_uid | string))
+            in gs_effective_environment.stdout_lines
+          - >-
+            ('RUN_WITH_USER_GID=' + (gs_run_gid | string))
+            in gs_effective_environment.stdout_lines
+        fail_msg: >-
+          The running container did not receive the expected lowercase
+          unprivileged UID/GID environment variables.
+
+    - name: Verify GeoServer startup
+      block:
+        - name: Wait for GeoServer container health
+          ansible.builtin.command:
+            argv:
+              - docker
+              - inspect
+              - -f
+              - "{% raw %}{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}{% endraw %}"
+              - "{{ gs_container_name }}"
+          register: gs_health
+          changed_when: false
+          retries: 60
+          delay: 5
+          until: gs_health.stdout | trim == 'healthy'
+
+        - name: Verify the local GeoServer web interface
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/web/"
+            status_code:
+              - 200
+              - 302
+            follow_redirects: none
+            return_content: false
+          register: gs_local_web
+          retries: 12
+          delay: 5
+          until: gs_local_web.status in [200, 302]
+
+      rescue:
+        - name: Collect GeoServer startup logs
+          ansible.builtin.command:
+            argv:
+              - docker
+              - logs
+              - --tail
+              - "250"
+              - "{{ gs_container_name }}"
+          register: gs_startup_logs
+          changed_when: false
+          failed_when: false
+
+        - name: Display GeoServer startup logs
+          ansible.builtin.debug:
+            msg: >-
+              {{
+                (gs_startup_logs.stdout_lines | default([]))
+                + (gs_startup_logs.stderr_lines | default([]))
+              }}
+
+        - name: Stop because GeoServer failed to become healthy
+          ansible.builtin.fail:
+            msg: "GeoServer did not become healthy. Review the container logs displayed above."
+
+    - name: Create GeoServer service role
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/roles/role/{{ gs_service_role }}"
+        method: POST
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 201, 409]
+        return_content: false
+      register: gs_service_role_result
+      failed_when: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Create GeoServer service role using the legacy route when required
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/roles/role/{{ gs_service_role }}"
+        method: POST
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 201, 409]
+        return_content: false
+      register: gs_service_role_legacy_result
+      failed_when: false
+      no_log: true
+      when:
+        - gs_security_setup
+        - gs_service_role_result.status | default(0) | int == 404
+
+    - name: Require GeoServer service role request to succeed
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              gs_service_role_legacy_result.status
+              | default(gs_service_role_result.status | default(0), true)
+              | int
+            ) in [200, 201, 409]
+        fail_msg: >-
+          GeoServer service-role creation returned HTTP
+          {{ gs_service_role_result.status | default('unknown') }} using the
+          service-specific route and HTTP
+          {{ gs_service_role_legacy_result.status | default('not attempted') }}
+          using the legacy route. Verify the administrator credentials, active
+          role service, and GeoServer REST API access.
+      when: gs_security_setup
+
+    - name: Create or update GeoServer service user
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/usergroup/users"
+        method: POST
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        body_format: raw
+        headers:
+          Content-Type: application/xml
+          Accept: application/xml
+        body: |
+          <user>
+            <userName>{{ gs_service_user }}</userName>
+            <password>{{ gs_service_password_input }}</password>
+            <enabled>true</enabled>
+          </user>
+        status_code: [200, 201, 409]
+        return_content: true
+      register: gs_service_user_result
+      failed_when: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Require GeoServer service user request to succeed
+      ansible.builtin.assert:
+        that:
+          - gs_service_user_result.status | default(0) | int in [200, 201, 409]
+        fail_msg: >-
+          GeoServer service-user creation returned HTTP
+          {{ gs_service_user_result.status | default('unknown') }}.
+          Verify the administrator credentials and the active default user/group service.
+      when: gs_security_setup
+
+    - name: Verify the GeoServer service user was persisted
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/usergroup/users"
+        method: GET
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        headers:
+          Accept: application/xml
+        status_code: [200]
+        return_content: true
+      register: gs_service_users_result
+      no_log: true
+      when: gs_security_setup
+
+    - name: Require the GeoServer service user to be present
+      ansible.builtin.assert:
+        that:
+          - gs_service_user in (gs_service_users_result.content | default(''))
+        fail_msg: >-
+          GeoServer accepted the service-user request but the user was not
+          persisted in the active default user/group service. Check the image
+          startup credential script and the mounted GeoServer data directory.
+      when: gs_security_setup
+
+    - name: Assign GeoServer service role to service user
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/roles/role/{{ gs_service_role }}/user/{{ gs_service_user }}"
+        method: POST
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 201, 409]
+        return_content: false
+      register: gs_service_role_assignment_result
+      failed_when: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Assign GeoServer service role using the legacy route when required
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/roles/role/{{ gs_service_role }}/user/{{ gs_service_user }}"
+        method: POST
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 201, 409]
+        return_content: false
+      register: gs_service_role_legacy_assignment_result
+      failed_when: false
+      no_log: true
+      when:
+        - gs_security_setup
+        - gs_service_role_assignment_result.status | default(0) | int == 404
+
+    - name: Require GeoServer service-role assignment request to succeed
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              gs_service_role_legacy_assignment_result.status
+              | default(gs_service_role_assignment_result.status | default(0), true)
+              | int
+            ) in [200, 201, 409]
+        fail_msg: >-
+          GeoServer service-role assignment returned HTTP
+          {{ gs_service_role_assignment_result.status | default('unknown') }}
+          using the service-specific route and HTTP
+          {{ gs_service_role_legacy_assignment_result.status | default('not attempted') }}
+          using the legacy route.
+      when: gs_security_setup
+
+    - name: Configure WFS as read-only Basic service
+      ansible.builtin.replace:
+        path: "{{ gs_dir }}/geoserver_data/wfs.xml"
+        regexp: '<serviceLevel>[^<]+</serviceLevel>'
+        replace: '<serviceLevel>BASIC</serviceLevel>'
+        backup: true
+      when:
+        - gs_security_setup
+
+    - name: Ensure WMS is enabled
+      ansible.builtin.replace:
+        path: "{{ gs_dir }}/geoserver_data/wms.xml"
+        regexp: '<enabled>[^<]+</enabled>'
+        replace: '<enabled>true</enabled>'
+        backup: true
+      when: gs_security_setup
+
+    - name: Ensure WFS is enabled
+      ansible.builtin.replace:
+        path: "{{ gs_dir }}/geoserver_data/wfs.xml"
+        regexp: '<enabled>[^<]+</enabled>'
+        replace: '<enabled>true</enabled>'
+        backup: true
+      when: gs_security_setup
+
+    - name: Configure global WMS/WFS service-security rules
+      ansible.builtin.blockinfile:
+        path: "{{ gs_dir }}/geoserver_data/security/services.properties"
+        create: true
+        owner: "{{ gs_run_uid }}"
+        group: "{{ gs_run_gid }}"
+        mode: "0640"
+        marker: "# {mark} ANSIBLE GEOSERVER SERVICE SECURITY"
+        block: |
+          wms.*={{ gs_service_role }}
+          wfs.*={{ gs_service_role }}
+      when: gs_security_setup
+
+    - name: Create the GeoServer AuthKey filter if absent
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/authfilters"
+        method: POST
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          org.geoserver.security.AuthenticationKeyFilterConfig:
+            name: authkey
+            className: org.geoserver.security.GeoServerAuthenticationKeyFilter
+            authKeyParamName: "{{ gs_authkey_parameter }}"
+            authKeyMapperName: userPropertyMapper
+            userGroupServiceName: default
+            allowMapperKeysAutoSync: true
+            allowChallengeAnonymousSessions: false
+        status_code: [200, 201, 409]
+        return_content: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Update the GeoServer AuthKey filter
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/authfilters/authkey"
+        method: PUT
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          org.geoserver.security.AuthenticationKeyFilterConfig:
+            name: authkey
+            className: org.geoserver.security.GeoServerAuthenticationKeyFilter
+            authKeyParamName: "{{ gs_authkey_parameter }}"
+            authKeyMapperName: userPropertyMapper
+            userGroupServiceName: default
+            allowMapperKeysAutoSync: true
+            allowChallengeAnonymousSessions: false
+        status_code: [200, 201, 404]
+        return_content: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Create or update the protected OGC filter chain
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/filterchain"
+        method: POST
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        body_format: raw
+        headers:
+          Content-Type: application/xml
+          Accept: application/xml
+        body: |
+          <filterchain>
+            <filters name="ogc"
+                     class="org.geoserver.security.ServiceLoginFilterChain"
+                     path="/ows,/ows/**,/wms,/wms/**,/wfs,/wfs/**"
+                     disabled="false"
+                     allowSessionCreation="false"
+                     ssl="false"
+                     matchHTTPMethod="false"
+                     interceptorName="interceptor"
+                     exceptionTranslationName="exception">
+              <filter>authkey</filter>
+            </filters>
+          </filterchain>
+        status_code: [200, 201, 409]
+        return_content: false
+      register: gs_ogc_chain_create_result
+      failed_when: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Require protected OGC filter chain request to succeed
+      ansible.builtin.assert:
+        that:
+          - gs_ogc_chain_create_result.status | default(0) | int in [200, 201, 409]
+        fail_msg: >-
+          GeoServer OGC filter-chain creation returned HTTP
+          {{ gs_ogc_chain_create_result.status | default('unknown') }}.
+          Verify the administrator credentials and AuthKey extension.
+      when: gs_security_setup
+
+    - name: Configure the protected OGC filter chain above default
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/filterchain/ogc"
+        method: PUT
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        body_format: raw
+        headers:
+          Content-Type: application/xml
+          Accept: application/xml
+        body: |
+          <filters name="ogc"
+                   class="org.geoserver.security.ServiceLoginFilterChain"
+                   path="/ows,/ows/**,/wms,/wms/**,/wfs,/wfs/**"
+                   disabled="false"
+                   allowSessionCreation="false"
+                   ssl="false"
+                   matchHTTPMethod="false"
+                   interceptorName="interceptor"
+                   exceptionTranslationName="exception">
+            <filter>authkey</filter>
+          </filters>
+        status_code: [200]
+        return_content: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Put the protected OGC filter chain before default
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/filterchain/order"
+        method: PUT
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          order:
+            - ogc
+            - web
+            - webLogin
+            - webLogout
+            - rest
+            - gwc
+            - default
+        status_code: [200]
+        return_content: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Reload GeoServer security configuration
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/reload"
+        method: POST
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 201]
+        return_content: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Wait for the AuthKey user registry file
+      ansible.builtin.wait_for:
+        path: "{{ gs_dir }}/geoserver_data/security/usergroup/default/users.xml"
+        state: present
+        timeout: 30
+      when: gs_security_setup
+
+    - name: Wait for AuthKey auto-synchronization to generate the service-user UUID
+      ansible.builtin.wait_for:
+        path: "{{ gs_dir }}/geoserver_data/security/usergroup/default/users.xml"
+        search_regex: '(?s)<user[^>]*name="{{ gs_service_user }}"[^>]*>.*?<property[^>]*name="UUID"[^>]*>[0-9a-fA-F-]{36}</property>'
+        timeout: 90
+      when: gs_security_setup
+
+    - name: Read the generated AuthKey user property
+      ansible.builtin.slurp:
+        src: "{{ gs_dir }}/geoserver_data/security/usergroup/default/users.xml"
+      register: gs_users_xml
+      no_log: true
+      when: gs_security_setup
+
+    - name: Extract the generated AuthKey without displaying it
+      ansible.builtin.set_fact:
+        gs_authkey_value: >-
+          {{
+            (
+              gs_users_xml.content | b64decode
+              | regex_findall(
+                  '(?s)<user[^>]*name="' ~ gs_service_user ~ '"[^>]*>.*?<property[^>]*name="UUID"[^>]*>([0-9a-fA-F-]{36})</property>'
+                )
+              | first
+              | default('')
+            )
+          }}
+      no_log: true
+      when: gs_security_setup
+
+    - name: Require a generated AuthKey for the GeoServer service user
+      ansible.builtin.assert:
+        that:
+          - gs_authkey_value | default('') is match('^[0-9a-fA-F-]{36}$')
+        fail_msg: >-
+          GeoServer did not generate a UUID AuthKey for {{ gs_service_user }}.
+          Confirm that the AuthKey filter is synchronized and that the user/group
+          service is writable.
+      when: gs_security_setup
+
+    - name: Finalize GeoServer AuthKey synchronization after user creation
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/security/authfilters/authkey"
+        method: PUT
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          org.geoserver.security.AuthenticationKeyFilterConfig:
+            name: authkey
+            className: org.geoserver.security.GeoServerAuthenticationKeyFilter
+            authKeyParamName: "{{ gs_authkey_parameter }}"
+            authKeyMapperName: userPropertyMapper
+            userGroupServiceName: default
+            allowMapperKeysAutoSync: true
+            allowChallengeAnonymousSessions: false
+        status_code: [200, 201]
+        return_content: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Reload GeoServer after final AuthKey synchronization
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/reload"
+        method: POST
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 201]
+        return_content: false
+      no_log: true
+      when: gs_security_setup
+
+    - name: Display AuthKey file location without exposing the key
+      ansible.builtin.debug:
+        msg:
+          - "AuthKey setup completed for {{ gs_service_user }}."
+          - "Open this file to read the generated UUID property: {{ gs_dir }}/geoserver_data/security/usergroup/default/users.xml"
+          - "Use the UUID as the {{ gs_authkey_parameter }} query parameter. Never place it in source control or logs."
+      when: gs_security_setup
+
+    - name: Wait for GeoServer CSP configuration file
+      ansible.builtin.wait_for:
+        path: "{{ gs_dir }}/geoserver_data/security/csp.xml"
+        state: present
+        timeout: 60
+
+    - name: Inject the local proxy base URL into GeoServer CSP
+      ansible.builtin.replace:
+        path: "{{ gs_dir }}/geoserver_data/security/csp.xml"
+        regexp: '<injectProxyBase>\s*false\s*</injectProxyBase>'
+        replace: "<injectProxyBase>true</injectProxyBase>"
+        backup: true
+      register: gs_csp_proxy_injection
+
+    - name: Put GeoServer CSP configuration into report-only mode
+      ansible.builtin.replace:
+        path: "{{ gs_dir }}/geoserver_data/security/csp.xml"
+        regexp: '<reportOnly>\s*false\s*</reportOnly>'
+        replace: "<reportOnly>true</reportOnly>"
+        backup: true
+      register: gs_csp_report_only_file
+
+    - name: Reload GeoServer after CSP proxy-base correction without restarting the container
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/reload"
+        method: POST
+        user: "{{ gs_admin_user }}"
+        password: "{{ gs_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 201]
+        return_content: false
+      no_log: true
+      when: gs_csp_proxy_injection.changed or gs_csp_report_only_file.changed
+
+    - name: Wait for GeoServer to become healthy after CSP correction
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - -f
+          - "{% raw %}{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}{% endraw %}"
+          - "{{ gs_container_name }}"
+      register: gs_csp_health
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: gs_csp_health.stdout | trim == 'healthy'
+      when: gs_csp_proxy_injection.changed or gs_csp_report_only_file.changed
+
+    - name: Verify GeoServer CSP file settings
+      ansible.builtin.shell: |
+        set -euo pipefail
+        grep -q '<injectProxyBase>true</injectProxyBase>' \
+          {{ (gs_dir + '/geoserver_data/security/csp.xml') | quote }}
+        grep -q '<reportOnly>true</reportOnly>' \
+          {{ (gs_dir + '/geoserver_data/security/csp.xml') | quote }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Read GeoServer CSP headers after report-only correction
+      ansible.builtin.shell: |
+        set -euo pipefail
+        curl -sS --max-time 20 \
+          -D - \
+          -o /dev/null \
+          "http://127.0.0.1:{{ gs_host_port }}/geoserver/web/?0" |
+          tr -d '\r' |
+          grep -iE '^Content-Security-Policy(-Report-Only)?:' || true
+      args:
+        executable: /bin/bash
+      register: gs_csp_headers
+      changed_when: false
+
+    - name: Display GeoServer CSP headers
+      ansible.builtin.debug:
+        var: gs_csp_headers.stdout_lines
+
+    - name: Verify GeoServer CSP is in report-only mode for login troubleshooting
+      ansible.builtin.assert:
+        that:
+          - gs_csp_headers.stdout is search('(?i)^Content-Security-Policy-Report-Only:', multiline=True)
+        fail_msg: >-
+          GeoServer did not switch CSP to report-only mode. Verify that the running
+          container contains the environment variable
+          org.geoserver.web.csp.strict=false and that
+          {{ gs_dir }}/geoserver_data/security/csp.xml contains
+          <reportOnly>true</reportOnly>.
+
+    - name: Verify the configured unprivileged UID can write GeoServer data
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - "{{ gs_run_uid }}:{{ gs_run_gid }}"
+          - "{{ gs_container_name }}"
+          - sh
+          - -lc
+          - >-
+            set -eu;
+            touch /opt/geoserver_data/.ansible-write-test;
+            rm -f /opt/geoserver_data/.ansible-write-test
+      changed_when: false
+
+    - name: Read GeoServer process ownership
+      ansible.builtin.command:
+        argv:
+          - docker
+          - top
+          - "{{ gs_container_name }}"
+          - -eo
+          - user,uid,gid,pid,comm
+      register: gs_process_ownership
+      changed_when: false
+
+    - name: Verify the GeoServer Java process is not running as root
+      ansible.builtin.shell: |
+        set -euo pipefail
+        printf '%s\n' {{ gs_process_ownership.stdout | quote }} |
+        awk '
+          NR == 1 { next }
+          $5 == "java" {
+            found = 1
+            if ($2 == 0) {
+              exit 2
+            }
+          }
+          END {
+            if (!found) {
+              exit 1
+            }
+          }
+        '
+      args:
+        executable: /bin/bash
+      register: gs_java_user_check
+      changed_when: false
+      failed_when: gs_java_user_check.rc != 0
+
+    - name: Display GeoServer process ownership
+      ansible.builtin.debug:
+        var: gs_process_ownership.stdout_lines
+
+    - name: Verify GeoServer administrator credentials when managed by this run
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --output
+          - /dev/null
+          - --write-out
+          - "%{http_code}"
+          - --user
+          - "{{ gs_admin_user }}:{{ gs_admin_password }}"
+          - --max-time
+          - "20"
+          - "http://127.0.0.1:{{ gs_host_port }}/geoserver/rest/workspaces.json"
+      register: gs_admin_auth_check
+      changed_when: false
+      failed_when: false
+      when: gs_manage_admin_credentials
+      no_log: true
+
+    - name: Display safe GeoServer administrator authentication result
+      ansible.builtin.debug:
+        msg: >-
+          GeoServer administrator REST authentication returned HTTP
+          {{ gs_admin_auth_check.stdout | default('unknown') | trim }}.
+          Expected HTTP 200.
+      when:
+        - gs_manage_admin_credentials
+        - gs_admin_auth_check.stdout | default('') | trim != '200'
+
+    - name: Check GeoServer startup log for credential initialization
+      ansible.builtin.shell: |
+        set -o pipefail
+        docker logs {{ gs_container_name | quote }} 2>&1 |
+        grep -E 'Loaded GeoServer admin|Using GeoServer admin|Updating GeoServer admin credentials|Successfully replaced|DONE updating GeoServer Credentials' |
+        tail -n 20
+      args:
+        executable: /bin/bash
+      register: gs_admin_credential_log_check
+      changed_when: false
+      failed_when: false
+      when:
+        - gs_manage_admin_credentials
+        - gs_admin_auth_check.stdout | default('') | trim != '200'
+
+    - name: Display credential initialization diagnostics
+      ansible.builtin.debug:
+        var: gs_admin_credential_log_check.stdout_lines
+      when:
+        - gs_manage_admin_credentials
+        - gs_admin_auth_check.stdout | default('') | trim != '200'
+
+    - name: Require configured GeoServer administrator credentials to work
+      ansible.builtin.assert:
+        that:
+          - gs_admin_auth_check.stdout | default('') | trim == '200'
+        fail_msg: >-
+          GeoServer is healthy, but the configured administrator credentials were not
+          accepted by the local REST API. The preceding safe diagnostic shows the HTTP
+          status and credential-initialization log lines without exposing the password.
+      when: gs_manage_admin_credentials
+
+    - name: Warn when existing data may retain different administrator credentials
+      ansible.builtin.debug:
+        msg: >-
+          This deployment reused an initialized GeoServer data directory.
+          Verify the administrator credentials manually. Environment-provided
+          credentials can affect existing users and roles, so rerun this playbook
+          with credential management set to no after the initial setup is confirmed.
+      when:
+        - gs_manage_admin_credentials
+        - gs_data_initialized_before.stat.exists
+
+    - name: Verify GeoServer container and network hardening
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        docker inspect {{ gs_container_name | quote }} \
+          --format '{% raw %}{{json .HostConfig.SecurityOpt}}{% endraw %}' |
+          grep -q 'no-new-privileges:true'
+
+        ss -ltn | grep -q '127.0.0.1:{{ gs_host_port }}'
+
+        if ss -ltn | grep ':{{ gs_host_port }}' |
+          grep -Ev '127\.0\.0\.1:{{ gs_host_port }}|::1:{{ gs_host_port }}' |
+          grep -q .; then
+          echo "GeoServer port is exposed on a non-loopback address" >&2
+          exit 1
+        fi
+
+        docker exec {{ gs_npm_container | quote }} \
+          curl -fsSI http://{{ gs_container_name }}:8080/geoserver/web/ >/dev/null
+
+        docker exec {{ gs_container_name | quote }} sh -lc \
+          'test ! -d /usr/local/tomcat/webapps/manager &&
+           test ! -d /usr/local/tomcat/webapps/host-manager'
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Verify TRACE is not accepted successfully
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -sS
+          - -o
+          - /dev/null
+          - -w
+          - "%{http_code}"
+          - -X
+          - TRACE
+          - "http://127.0.0.1:{{ gs_host_port }}/geoserver/"
+      register: gs_trace_check
+      changed_when: false
+      failed_when: gs_trace_check.stdout | trim | int in [200, 201, 202, 204]
+
+    - name: Write NPM advanced path-restriction configuration
+      ansible.builtin.copy:
+        dest: "{{ gs_dir }}/NPM_ADVANCED_CONFIG.conf"
+        owner: "{{ gs_deploy_user }}"
+        group: root
+        mode: "0644"
+        content: |
+          # ============================================================
+          # GeoServer NPM Advanced Configuration
+          # Upstream: http://{{ gs_container_name }}:8080
+          # Local URL: http://{{ gs_domain }}/geoserver/
+          #
+          # IP restrictions are intentionally NOT configured here.
+          # This configuration is intended for the local Nginx/NPM network only.
+          # ============================================================
+
+          location = /geoserver {
+              return 301 /geoserver/;
+          }
+
+          location = /geoserver/web {
+              return 301 /geoserver/web/;
+          }
+
+          location ^~ /geoserver/web/ {
+              proxy_pass http://{{ gs_container_name }}:8080;
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Host $host;
+              proxy_set_header X-Forwarded-Proto http;
+              proxy_set_header X-Forwarded-Port 80;
+
+              proxy_set_header Connection "";
+              proxy_connect_timeout 30s;
+              proxy_send_timeout 120s;
+              proxy_read_timeout 120s;
+          }
+
+          location = /geoserver/rest {
+              return 301 /geoserver/rest/;
+          }
+
+          location ^~ /geoserver/rest/ {
+              proxy_pass http://{{ gs_container_name }}:8080;
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Host $host;
+              proxy_set_header X-Forwarded-Proto http;
+              proxy_set_header X-Forwarded-Port 80;
+
+              proxy_set_header Connection "";
+              proxy_connect_timeout 30s;
+              proxy_send_timeout 120s;
+              proxy_read_timeout 120s;
+          }
+
+          location = /geoserver/j_spring_security_check {
+              proxy_pass http://{{ gs_container_name }}:8080;
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Host $host;
+              proxy_set_header X-Forwarded-Proto http;
+              proxy_set_header X-Forwarded-Port 80;
+
+              proxy_set_header Connection "";
+              proxy_connect_timeout 30s;
+              proxy_send_timeout 120s;
+              proxy_read_timeout 120s;
+          }
+
+          location = /geoserver/j_spring_security_logout {
+              proxy_pass http://{{ gs_container_name }}:8080;
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Host $host;
+              proxy_set_header X-Forwarded-Proto http;
+              proxy_set_header X-Forwarded-Port 80;
+
+              proxy_set_header Connection "";
+              proxy_connect_timeout 30s;
+              proxy_send_timeout 120s;
+              proxy_read_timeout 120s;
+          }
+
+          location ~* ^/geoserver/([^/]+/)?(wms|wfs|wcs|wmts|ows)(/.*)?$ {
+              proxy_pass http://{{ gs_container_name }}:8080;
+              proxy_http_version 1.1;
+
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Host $host;
+              proxy_set_header X-Forwarded-Proto http;
+              proxy_set_header X-Forwarded-Port 80;
+
+              proxy_set_header Connection "";
+              proxy_connect_timeout 30s;
+              proxy_send_timeout 120s;
+              proxy_read_timeout 120s;
+
+              proxy_buffer_size 128k;
+              proxy_buffers 8 256k;
+              proxy_busy_buffers_size 512k;
+          }
+
+          # Do not use ^~ here; the OGC regex location above must remain eligible.
+          location /geoserver/ {
+              return 403;
+          }
+
+    - name: Read generated NPM advanced configuration
+      ansible.builtin.slurp:
+        src: "{{ gs_dir }}/NPM_ADVANCED_CONFIG.conf"
+      register: gs_npm_advanced_file
+
+    - name: Display automatic verification results
+      ansible.builtin.debug:
+        msg:
+          - "GeoServer is healthy at http://127.0.0.1:{{ gs_host_port }}/geoserver/web/."
+          - "The host port is bound only to 127.0.0.1."
+          - "NPM can reach GeoServer through http://{{ gs_container_name }}:8080."
+          - "The Java process is running without UID 0."
+
+    - name: Display local Nginx setup instructions
+      ansible.builtin.debug:
+        msg:
+          - "Use the local endpoint http://localhost/geoserver/."
+          - "Keep {{ gs_host_port }} and container port 8080 unexposed outside localhost/Docker networks."
+          - "For remote browser access, tunnel the remote NPM port 80 to local port 80."
+          - "NPM scheme: http"
+          - "NPM forward hostname: {{ gs_container_name }}"
+          - "NPM forward port: 8080"
+      when: gs_pause
+
+    - name: Pause for NPM basic proxy and SSL configuration
+      ansible.builtin.pause:
+        prompt: >-
+          Type yes after the local Nginx/NPM proxy is configured
+      register: gs_proxy_confirmation
+      when: gs_pause
+
+    - name: Require NPM basic proxy and SSL confirmation
+      ansible.builtin.assert:
+        that:
+          - gs_proxy_confirmation.user_input | default('') | trim | lower == 'yes'
+        fail_msg: "Stopped because the NPM and SSL setup was not confirmed."
+      when: gs_pause
+
+    - name: Test GeoServer through localhost
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -sS
+          - -o
+          - /dev/null
+          - -w
+          - "%{http_code}"
+          - --max-time
+          - "20"
+          - "http://127.0.0.1:{{ gs_host_port }}/geoserver/web/"
+      register: gs_https_test
+      changed_when: false
+      failed_when: gs_https_test.stdout | trim | int not in [200, 301, 302, 403]
+      when: gs_pause
+
+    - name: Display generated NPM Advanced configuration
+      ansible.builtin.debug:
+        msg: "{{ gs_npm_advanced_file.content | b64decode }}"
+      when: gs_pause
+
+    - name: Pause for NPM path restrictions
+      ansible.builtin.pause:
+        prompt: >-
+          Paste the displayed configuration into the NPM Advanced tab, save it,
+          and type yes after the Nginx configuration reloads successfully
+      register: gs_path_confirmation
+      when: gs_pause
+
+    - name: Require NPM path-restriction confirmation
+      ansible.builtin.assert:
+        that:
+          - gs_path_confirmation.user_input | default('') | trim | lower == 'yes'
+        fail_msg: "Stopped because the NPM path restrictions were not confirmed."
+      when: gs_pause
+
+    - name: Validate NPM Nginx configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ gs_npm_container }}"
+          - nginx
+          - -t
+      changed_when: false
+      when: gs_pause
+
+    - name: Verify anonymous local OGC access is blocked
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -sS
+          - -o
+          - /dev/null
+          - -w
+          - "%{http_code}"
+          - --max-time
+          - "20"
+          - "http://127.0.0.1:{{ gs_host_port }}/geoserver/ows?service=WMS&request=GetCapabilities"
+      register: gs_ogc_test
+      changed_when: false
+      # The request intentionally has no AuthKey. With the documented WMS/WFS
+      # service-security rules, anonymous access must be denied.
+      failed_when: gs_ogc_test.stdout | trim | int not in [401, 403]
+      when: gs_pause
+
+    - name: Verify anonymous local WFS access is blocked
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -sS
+          - -o
+          - /dev/null
+          - -w
+          - "%{http_code}"
+          - --max-time
+          - "20"
+          - "http://127.0.0.1:{{ gs_host_port }}/geoserver/ows?service=WFS&version=2.0.0&request=GetCapabilities"
+      register: gs_wfs_anonymous_test
+      changed_when: false
+      failed_when: gs_wfs_anonymous_test.stdout | trim | int not in [401, 403]
+      when:
+        - gs_pause
+        - gs_security_setup
+
+    - name: Verify authenticated WMS access with the generated AuthKey
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/ows?service=WMS&version=1.3.0&request=GetCapabilities&authkey={{ gs_authkey_value }}"
+        method: GET
+        status_code: [200]
+        return_content: false
+        timeout: 30
+      register: gs_wms_local_authenticated_test
+      changed_when: false
+      no_log: true
+      when:
+        - gs_pause
+        - gs_security_setup
+
+    - name: Verify authenticated local WMS access with the generated AuthKey
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/ows?service=WMS&version=1.3.0&request=GetCapabilities&authkey={{ gs_authkey_value }}"
+        method: GET
+        status_code: [200]
+        return_content: false
+        timeout: 30
+      register: gs_wms_authenticated_test
+      changed_when: false
+      no_log: true
+      when:
+        - gs_pause
+        - gs_security_setup
+
+    - name: Verify authenticated local WFS access with the generated AuthKey
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/ows?service=WFS&version=2.0.0&request=GetCapabilities&authkey={{ gs_authkey_value }}"
+        method: GET
+        status_code: [200]
+        return_content: false
+        timeout: 30
+      register: gs_wfs_authenticated_test
+      changed_when: false
+      no_log: true
+      when:
+        - gs_pause
+        - gs_security_setup
+
+    - name: Verify authenticated WMS map and WFS feature access when a test layer is supplied
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ gs_host_port }}/geoserver/ows?service={{ item.service }}&version={{ item.version }}&request={{ item.request }}&layers={{ gs_test_layer }}&query_layers={{ gs_test_layer }}&typeNames={{ gs_test_layer }}&bbox=-180,-90,180,90&crs=EPSG:4326&srs=EPSG:4326&width=256&height=256&format={{ item.format }}&authkey={{ gs_authkey_value }}"
+        method: GET
+        status_code: [200]
+        return_content: false
+        timeout: 30
+      loop:
+        - service: WMS
+          version: "1.3.0"
+          request: GetMap
+          format: image/png
+        - service: WFS
+          version: "2.0.0"
+          request: GetFeature
+          format: application/json
+      changed_when: false
+      no_log: true
+      when:
+        - gs_pause
+        - gs_security_setup
+        - gs_test_layer | default('') | trim | length > 0
+
+    - name: Display GeoServer WMS/WFS security configuration instructions
+      ansible.builtin.debug:
+        msg:
+          - "Configure GeoServer Security -> Users, Groups, and Roles: create/enable '{{ gs_service_user }}' and assign only '{{ gs_service_role }}'."
+          - "Configure Security -> Services: wms.*={{ gs_service_role }} and wfs.*={{ gs_service_role }}; set Grant access to any role to No."
+          - "Configure Services -> WFS: Enabled=Yes and Service Level=Basic. Do not enable Transactional or Complete."
+          - "Configure Security -> Authentication -> AuthKey: URL parameter='{{ gs_authkey_parameter }}', mapper=User property, User/Group Service=default, and synchronize the user/group service."
+          - "Create the protected ogc filter chain above default with patterns /ows,/ows/**,/wms,/wms/**,/wfs,/wfs/** and authkey selected; do not add anonymous to ogc."
+          - "Use HTTPS for every AuthKey request. Keep the key server-side and redact '{{ gs_authkey_parameter }}=' from proxy, application, monitoring, and error logs."
+          - "Optional workspace isolation: add a read-only resource rule for {{ gs_workspace | default('base_imis', true) }} only after verifying the exact syntax supported by this GeoServer version."
+      when: not gs_security_setup
+
+    - name: Display AuthKey retrieval instruction without exposing the secret
+      ansible.builtin.debug:
+        msg:
+          - "After synchronizing AuthKey for '{{ gs_service_user }}', open this file on the server and read the generated UUID property for that user:"
+          - "sudo less {{ gs_dir }}/geoserver_data/security/usergroup/default/users.xml"
+          - "Use that UUID as the '{{ gs_authkey_parameter }}' query parameter. Never commit it, paste it into this playbook, or include it in documentation/logs."
+      when: not gs_security_setup
+
+    - name: Display GeoServer application configuration
+      ansible.builtin.debug:
+        msg:
+          - "GeoServer deployment completed."
+          - "Compose directory: {{ gs_dir }}"
+          - "Local endpoint: http://127.0.0.1:{{ gs_host_port }}/geoserver/"
+          - >-
+            SSH tunnel (run on Windows): ssh -p {{ ansible_port | default(22) }}
+            -N -L 80:127.0.0.1:80
+            {{ ansible_user | default(ansible_user_id) }}@{{ ansible_host | default(inventory_hostname) }}
+          - "GEOSERVER_WORKSPACE={{ gs_workspace | default('<workspace_name>', true) }}"
+          - "GEOSERVER=http://localhost/geoserver/"
+          - "GEOSERVER_URL=http://localhost/geoserver/{{ gs_workspace | default('<workspace_name>', true) }}/"
+          - "AUTH_KEY=<read_the_UUID_property_for_{{ gs_service_user }}_from_{{ gs_dir }}/geoserver_data/security/usergroup/default/users.xml>"
+          - >-
+            After confirming administrator access, rerun with
+            'Set GeoServer administrator credentials ...' set to no so the
+            credential secret mounts are removed from subsequent container restarts.
+          - "To apply later .env changes without losing data, run: cd {{ gs_dir }}"
+          - "Then create a backup: sudo tar -czf backups/geoserver_data-<timestamp>.tar.gz geoserver_data"
+          - "Validate the configuration: sudo docker compose config"
+          - "Recreate safely: sudo docker compose up -d --build --force-recreate"
+          - "Do not run 'docker compose down -v' and do not delete {{ gs_dir }}/geoserver_data."
