@@ -14,10 +14,43 @@ fi
 
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
     echo "Creating virtual environment: ${VENV_DIR}"
-    python3 -m venv "${VENV_DIR}"
+    if ! python3 -m venv "${VENV_DIR}"; then
+        echo "Python's venv/pip support is missing. Installing Debian/Ubuntu prerequisites..." >&2
+        rm -rf "${VENV_DIR}"
+
+        if ! command -v apt-get >/dev/null 2>&1; then
+            echo "Install Python venv and pip support manually, then rerun this script:" >&2
+            echo "  sudo apt update" >&2
+            echo "  sudo apt install -y python3-venv python3-pip" >&2
+            exit 1
+        fi
+
+        if [[ "${EUID}" -eq 0 ]]; then
+            APT_PREFIX=()
+        elif command -v sudo >/dev/null 2>&1; then
+            APT_PREFIX=(sudo)
+        else
+            echo "sudo is required to install Python venv and pip support." >&2
+            echo "Run these commands manually, then rerun this script:" >&2
+            echo "  sudo apt update" >&2
+            echo "  sudo apt install -y python3-venv python3-pip" >&2
+            exit 1
+        fi
+
+        "${APT_PREFIX[@]}" apt-get update
+        "${APT_PREFIX[@]}" apt-get install -y python3-venv python3-pip
+        python3 -m venv "${VENV_DIR}"
+    fi
 fi
 
 PYTHON="${VENV_DIR}/bin/python"
+
+if ! "${PYTHON}" -m pip --version >/dev/null 2>&1; then
+    echo "The virtual environment has no pip. Recreate it after installing python3-venv." >&2
+    echo "  sudo apt update" >&2
+    echo "  sudo apt install -y python3-venv python3-pip" >&2
+    exit 1
+fi
 
 echo "Installing/updating Python requirements..."
 "${PYTHON}" -m pip install --requirement "${SCRIPT_DIR}/requirements.txt"

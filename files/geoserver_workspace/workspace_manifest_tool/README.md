@@ -80,6 +80,16 @@ The included `run_workspace_manifest_tool.sh` launcher creates or reuses a
 Python virtual environment, installs the requirements, checks for the local
 `icons` directory, and starts the interactive workspace importer.
 
+On Debian or Ubuntu, the launcher checks that the virtual environment contains
+pip. If Python's `venv` support is missing, it installs the required packages
+when `sudo` is available and retries automatically. The equivalent manual
+repair commands are:
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv python3-pip
+```
+
 From the directory containing the tool, run:
 
 ```bash

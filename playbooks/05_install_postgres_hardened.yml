@@ -784,4 +784,4 @@
           - "Public remote allowlist={{ pg_public_allowed_list | join(', ') if pg_public_allowed_list | length > 0 else 'none' }}"
           - "Private remote allowlist={{ pg_private_allowed_list | join(', ') if pg_private_allowed_list | length > 0 else 'none' }}"
           - "If pg_bind_ip is 127.0.0.1, the published host port is local-only."
-          - "Tunnel: ssh -p <ssh_port> -N -L 15432:127.0.0.1:15432 <admin_user>@<server_ip>"
+          - "Tunnel: ssh -p {{ npm_ssh_port | default('2224') }} -N -L 15432:127.0.0.1:15432 {{ npm_admin_user | default(ansible_user | default('innovative')) }}@{{ ansible_host }}"
