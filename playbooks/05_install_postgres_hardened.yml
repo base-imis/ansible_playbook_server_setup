@@ -1,0 +1,786 @@
+---
+- name: Install hardened PostgreSQL, PostGIS, and pgRouting in Docker
+  hosts: hardening_target
+  become: true
+  gather_facts: true
+
+  # This playbook supports both modes:
+  #   1. Interactive prompts:
+  #      ansible-playbook -i inventory.ini playbooks/postgres.yml --ask-become-pass
+  #
+  #   2. Encrypted variables / Ansible Vault:
+  #      ansible-playbook -i inventory.ini playbooks/postgres.yml \
+  #        -e @vars/variables.yml --ask-vault-pass --ask-become-pass
+  #
+  # vars_prompt entries are skipped automatically when the same variable is
+  # already supplied through inventory, -e, or a Vault-encrypted vars file.
+
+  vars_prompt:
+    - name: pg_version
+      prompt: "PostgreSQL major version (14, 15, or 16)"
+      default: "14"
+      private: false
+
+    - name: pg_dir
+      prompt: "Install directory"
+      default: "/home/innovative/postgres14"
+      private: false
+
+    - name: pg_default_database
+      prompt: "Default PostgreSQL database name"
+      default: defaultdb
+      private: false
+
+    - name: pg_admin_user
+      prompt: "DB admin user"
+      default: innovative
+      private: false
+
+    - name: pg_admin_password
+      prompt: "Password for the DB admin user"
+      private: true
+      confirm: true
+
+    - name: pg_postgres_password
+      prompt: "Password for the postgres superuser"
+      private: true
+      confirm: true
+
+    - name: pg_host_port
+      prompt: "Host port for PostgreSQL"
+      default: "15432"
+      private: false
+
+    - name: pg_bind_ip
+      prompt: "Host bind IP (127.0.0.1 for local-only, 0.0.0.0 for remote access)"
+      default: "127.0.0.1"
+      private: false
+
+    - name: pg_access_mode
+      prompt: "Access mode: A=public/admin allowlist only, C=public plus private/internal allowlists"
+      default: A
+      private: false
+
+    - name: pg_public_allowed_ips
+      prompt: "Public/admin allowed IPs or CIDRs, comma-separated (optional)"
+      default: ""
+      private: false
+
+    - name: pg_private_allowed_ips
+      prompt: "Private/internal allowed IPs or CIDRs, comma-separated (optional)"
+      default: ""
+      private: false
+
+    - name: pg_strict_connect_input
+      prompt: "Apply strict CONNECT isolation? (true/false)"
+      default: "true"
+      private: false
+
+    - name: pg_disable_postgres_login_input
+      prompt: "Disable postgres login after admin verification? (true/false)"
+      default: "true"
+      private: false
+
+    - name: pg_pause_input
+      prompt: "Pause before using an existing PostgreSQL data directory? (yes/no)"
+      default: "yes"
+      private: false
+
+  vars:
+    pg_max_connections: 50
+    pg_shared_buffers: 256MB
+    pg_work_mem: 8MB
+    pg_maintenance_work_mem: 128MB
+
+    # Docker networks created by Docker normally fall inside this range.
+    # This permits application containers to reach PostgreSQL through Docker
+    # networking while public/private source allowlists remain optional.
+    pg_docker_bridge_cidr: 172.16.0.0/12
+    pg_allow_docker_bridge_access: true
+
+  pre_tasks:
+    - name: Normalize PostgreSQL inputs
+      ansible.builtin.set_fact:
+        pg_access_mode_normalized: "{{ pg_access_mode | upper }}"
+        pg_public_allowed_list: >-
+          {{
+            pg_public_allowed_ips
+            | default('')
+            | regex_replace(',', ' ')
+            | split
+            | reject('equalto', '')
+            | list
+          }}
+        pg_private_allowed_list: >-
+          {{
+            (
+              pg_private_allowed_ips
+              | default('')
+              | regex_replace(',', ' ')
+              | split
+              | reject('equalto', '')
+              | list
+            )
+            if (pg_access_mode | upper) == 'C'
+            else []
+          }}
+        pg_strict_connect_isolation: >-
+          {{ pg_strict_connect_input | lower in ['true', 'yes', 'y', '1'] }}
+        pg_disable_postgres_login: >-
+          {{ pg_disable_postgres_login_input | lower in ['true', 'yes', 'y', '1'] }}
+        pg_pause: >-
+          {{ pg_pause_input | lower in ['yes', 'y', 'true', '1'] }}
+        pg_container_name: "postgres{{ pg_version }}"
+        pg_network_name: "postgres{{ pg_version }}_backend"
+        pg_postgis_image: "pgrouting/pgrouting:{{ pg_version }}-3.5-4.0"
+        pg_secret_postgres: "pg{{ pg_version }}_postgres_password"
+        pg_secret_admin: "pg{{ pg_version }}_admin_password"
+        pg_firewall_marker: "pg{{ pg_version }}_hostport_{{ pg_host_port }}"
+
+    - name: Validate PostgreSQL inputs
+      ansible.builtin.assert:
+        that:
+          - pg_version in ['14', '15', '16']
+          - pg_dir.startswith('/')
+          - "'postgres' in pg_dir"
+          - pg_dir not in ['/', '/home', '/opt', '/var', '/usr', '/root', '/home/innovative']
+          - pg_default_database is match('^[A-Za-z_][A-Za-z0-9_]*$')
+          - pg_admin_user is match('^[A-Za-z_][A-Za-z0-9_]*$')
+          - pg_admin_user != 'postgres'
+          - pg_host_port | int >= 1
+          - pg_host_port | int <= 65535
+          - pg_access_mode_normalized in ['A', 'C']
+          - pg_admin_password | length > 0
+          - pg_postgres_password | length > 0
+        fail_msg: "One or more PostgreSQL deployment inputs are invalid."
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Prerequisites
+    # ------------------------------------------------------------------
+
+    - name: Verify Docker is installed and running
+      ansible.builtin.command: docker info
+      changed_when: false
+
+    - name: Verify Docker Compose plugin
+      ansible.builtin.command: docker compose version
+      changed_when: false
+
+    - name: Ensure Python and iptables are installed
+      ansible.builtin.apt:
+        name:
+          - python3
+          - iptables
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure PostgreSQL/PostGIS/pgRouting image is available
+      ansible.builtin.command:
+        argv:
+          - docker
+          - pull
+          - "{{ pg_postgis_image }}"
+      register: pg_image_pull
+      changed_when: >-
+        'Downloaded newer image' in pg_image_pull.stdout or
+        'Pull complete' in pg_image_pull.stdout
+
+    - name: Detect postgres UID and GID inside the image
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --entrypoint
+          - /bin/sh
+          - "{{ pg_postgis_image }}"
+          - -c
+          - >-
+            printf '%s %s\n' "$(id -u postgres)" "$(id -g postgres)"
+      register: pg_container_identity
+      changed_when: false
+
+    - name: Validate detected PostgreSQL container identity
+      ansible.builtin.assert:
+        that:
+          - pg_container_identity.stdout.split() | length == 2
+          - pg_container_identity.stdout.split()[0] is match('^[0-9]+$')
+          - pg_container_identity.stdout.split()[1] is match('^[0-9]+$')
+        fail_msg: "Unable to detect the postgres UID/GID from {{ pg_postgis_image }}."
+
+    - name: Store PostgreSQL container UID and GID
+      ansible.builtin.set_fact:
+        pg_container_internal_uid: "{{ pg_container_identity.stdout.split()[0] | int }}"
+        pg_container_internal_gid: "{{ pg_container_identity.stdout.split()[1] | int }}"
+        pg_container_uid: "{{ pg_container_identity.stdout.split()[0] | int }}"
+        pg_container_gid: "{{ pg_container_identity.stdout.split()[1] | int }}"
+
+    - name: Show PostgreSQL UID/GID ownership
+      ansible.builtin.debug:
+        msg:
+          - "Container postgres UID:GID={{ pg_container_internal_uid }}:{{ pg_container_internal_gid }}"
+          - "Host bind-mount UID:GID={{ pg_container_uid }}:{{ pg_container_gid }}"
+
+    # ------------------------------------------------------------------
+    # Directories and secrets
+    # ------------------------------------------------------------------
+
+    - name: Create PostgreSQL deployment directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ pg_dir }}", owner: root, group: root, mode: "0755" }
+        - { path: "{{ pg_dir }}/data", owner: "{{ pg_container_uid }}", group: "{{ pg_container_gid }}", mode: "0700" }
+        - { path: "{{ pg_dir }}/backups", owner: root, group: root, mode: "0750" }
+        - { path: "{{ pg_dir }}/logs", owner: "{{ pg_container_uid }}", group: "{{ pg_container_gid }}", mode: "0700" }
+        - { path: "{{ pg_dir }}/conf", owner: root, group: root, mode: "0755" }
+        - { path: "{{ pg_dir }}/init", owner: root, group: root, mode: "0755" }
+        # PostgreSQL reads the mounted secret files after the entrypoint drops
+        # privileges to the postgres UID. The directory itself must therefore
+        # be traversable by that UID; root can still write the files because
+        # the playbook runs with become.
+        - { path: "{{ pg_dir }}/secrets", owner: "{{ pg_container_uid }}", group: "{{ pg_container_gid }}", mode: "0700" }
+
+    - name: Correct ownership of existing PostgreSQL writable content
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: "{{ pg_container_uid }}"
+        group: "{{ pg_container_gid }}"
+        recurse: true
+      loop:
+        - "{{ pg_dir }}/data"
+        - "{{ pg_dir }}/logs"
+
+    - name: Verify PostgreSQL user can write bind mounts
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --user
+          - "{{ pg_container_internal_uid }}:{{ pg_container_internal_gid }}"
+          - --volume
+          - "{{ pg_dir }}/data:/mnt/pgdata:rw"
+          - --volume
+          - "{{ pg_dir }}/logs:/mnt/pglogs:rw"
+          - --entrypoint
+          - /bin/sh
+          - "{{ pg_postgis_image }}"
+          - -c
+          - >-
+            touch /mnt/pgdata/.ansible-write-test &&
+            touch /mnt/pglogs/.ansible-write-test &&
+            rm -f /mnt/pgdata/.ansible-write-test &&
+            rm -f /mnt/pglogs/.ansible-write-test
+      changed_when: false
+
+    - name: Write postgres superuser secret
+      ansible.builtin.copy:
+        dest: "{{ pg_dir }}/secrets/{{ pg_secret_postgres }}.txt"
+        content: "{{ pg_postgres_password }}"
+        owner: "{{ pg_container_uid }}"
+        group: "{{ pg_container_gid }}"
+        mode: "0400"
+      no_log: true
+
+    - name: Write DB admin secret
+      ansible.builtin.copy:
+        dest: "{{ pg_dir }}/secrets/{{ pg_secret_admin }}.txt"
+        content: "{{ pg_admin_password }}"
+        owner: "{{ pg_container_uid }}"
+        group: "{{ pg_container_gid }}"
+        mode: "0400"
+      no_log: true
+
+    # ------------------------------------------------------------------
+    # PostgreSQL configuration files
+    # ------------------------------------------------------------------
+
+    - name: Write postgresql.conf
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/05_postgresql.conf.j2"
+        dest: "{{ pg_dir }}/conf/postgresql.conf"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+
+    - name: Write pg_hba.conf allowlist
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/05_pg_hba.conf.j2"
+        dest: "{{ pg_dir }}/conf/pg_hba.conf"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+
+    - name: Write database initialization script
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/05_postgres_init.sh.j2"
+        dest: "{{ pg_dir }}/init/01-create-users.sh"
+        owner: root
+        group: root
+        mode: "0755"
+        backup: true
+
+    - name: Write PostgreSQL Compose file
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/05_postgres_compose.yml.j2"
+        dest: "{{ pg_dir }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+
+    - name: Validate PostgreSQL Compose file
+      ansible.builtin.command: docker compose config
+      args:
+        chdir: "{{ pg_dir }}"
+      changed_when: false
+
+    # ------------------------------------------------------------------
+    # Existing-data safety checkpoint
+    # ------------------------------------------------------------------
+
+    - name: Inspect existing PostgreSQL data
+      ansible.builtin.find:
+        paths: "{{ pg_dir }}/data"
+        hidden: true
+        file_type: any
+        recurse: false
+      register: pg_existing_data
+
+    - name: Pause before using an existing PostgreSQL data directory
+      ansible.builtin.pause:
+        prompt: >-
+          {{ pg_dir }}/data is not empty. Docker init scripts will not run again.
+          Type yes to continue with the existing PostgreSQL data.
+      register: pg_existing_data_confirmation
+      when:
+        - pg_pause
+        - pg_existing_data.matched | int > 0
+
+    - name: Require confirmation for existing PostgreSQL data
+      ansible.builtin.assert:
+        that:
+          - pg_existing_data_confirmation.user_input | default('no') | lower == 'yes'
+        fail_msg: "Deployment stopped because the existing PostgreSQL data directory was not confirmed."
+      when:
+        - pg_pause
+        - pg_existing_data.matched | int > 0
+
+    # ------------------------------------------------------------------
+    # Start PostgreSQL/PostGIS/pgRouting
+    # ------------------------------------------------------------------
+
+    - name: Start PostgreSQL/PostGIS/pgRouting stack
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: "{{ pg_dir }}"
+      register: pg_up
+      changed_when: >-
+        'Started' in pg_up.stdout or
+        'Created' in pg_up.stdout or
+        'Recreated' in pg_up.stdout or
+        'Creating' in pg_up.stdout
+
+    - name: Wait for PostgreSQL readiness
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ pg_container_name }}"
+          - pg_isready
+          - -h
+          - 127.0.0.1
+          - -p
+          - "5432"
+          - -d
+          - "{{ pg_default_database }}"
+      register: pg_ready
+      retries: 24
+      delay: 5
+      until: pg_ready.rc == 0
+      changed_when: false
+
+    - name: Ensure PostgreSQL initialization script has completed
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - "{{ pg_container_name }}"
+          - /docker-entrypoint-initdb.d/01-create-users.sh
+      register: pg_initialization_script
+      changed_when: false
+      no_log: true
+
+    - name: Enable PostGIS and pgRouting in the default database
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ pg_admin_password }}"
+          - "{{ pg_container_name }}"
+          - psql
+          - -v
+          - ON_ERROR_STOP=1
+          - -U
+          - "{{ pg_admin_user }}"
+          - -d
+          - "{{ pg_default_database }}"
+          - -c
+          - >-
+            CREATE EXTENSION IF NOT EXISTS postgis;
+            CREATE EXTENSION IF NOT EXISTS postgis_topology;
+            CREATE EXTENSION IF NOT EXISTS pgrouting;
+      changed_when: true
+      no_log: true
+
+    - name: Verify PostGIS and pgRouting are enabled in the default database
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ pg_admin_password }}"
+          - "{{ pg_container_name }}"
+          - psql
+          - -v
+          - ON_ERROR_STOP=1
+          - -U
+          - "{{ pg_admin_user }}"
+          - -d
+          - "{{ pg_default_database }}"
+          - -tAc
+          - >-
+            SELECT count(*) FROM pg_extension
+            WHERE extname IN ('postgis', 'postgis_topology', 'pgrouting');
+      register: pg_spatial_extensions_check
+      changed_when: false
+      failed_when: pg_spatial_extensions_check.stdout | trim | int != 3
+      no_log: true
+
+    # ------------------------------------------------------------------
+    # Application databases and users are managed by 051_postgres_helper.yml.
+    # This playbook only provisions PostgreSQL and the DB admin user.
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Docker firewall
+    # ------------------------------------------------------------------
+
+    - name: Check DOCKER-USER chain
+      ansible.builtin.command:
+        argv:
+          - iptables
+          - -L
+          - DOCKER-USER
+          - -n
+      register: pg_docker_user_chain
+      changed_when: false
+      failed_when: false
+
+    - name: Remove existing PostgreSQL managed firewall rules
+      ansible.builtin.shell: |
+        set -euo pipefail
+        marker="{{ pg_firewall_marker }}"
+
+        while true; do
+          line_num="$(
+            iptables -L DOCKER-USER --line-numbers -n 2>/dev/null |
+            grep -F "$marker" |
+            awk '{print $1}' |
+            head -1 || true
+          )"
+
+          if [[ -z "$line_num" ]]; then
+            break
+          fi
+
+          iptables -D DOCKER-USER "$line_num"
+        done
+      args:
+        executable: /bin/bash
+      when: pg_docker_user_chain.rc == 0
+      changed_when: true
+
+    # DROP is inserted first. ACCEPT rules inserted afterwards at position 1
+    # remain above it, so allowed clients are accepted before the final DROP.
+    - name: Add PostgreSQL default DROP rule
+      ansible.builtin.command:
+        argv:
+          - iptables
+          - -I
+          - DOCKER-USER
+          - "1"
+          - -p
+          - tcp
+          - -m
+          - conntrack
+          - --ctorigdstport
+          - "{{ pg_host_port }}"
+          - -m
+          - comment
+          - --comment
+          - "{{ pg_firewall_marker }}_drop_others"
+          - -j
+          - DROP
+      when: pg_docker_user_chain.rc == 0
+      changed_when: true
+
+    - name: Allow localhost to PostgreSQL
+      ansible.builtin.command:
+        argv:
+          - iptables
+          - -I
+          - DOCKER-USER
+          - "1"
+          - -p
+          - tcp
+          - -s
+          - 127.0.0.1/32
+          - -m
+          - conntrack
+          - --ctorigdstport
+          - "{{ pg_host_port }}"
+          - -m
+          - comment
+          - --comment
+          - "{{ pg_firewall_marker }}_allow_localhost"
+          - -j
+          - ACCEPT
+      when: pg_docker_user_chain.rc == 0
+      changed_when: true
+
+    - name: Allow Docker bridge networks to PostgreSQL
+      ansible.builtin.command:
+        argv:
+          - iptables
+          - -I
+          - DOCKER-USER
+          - "1"
+          - -p
+          - tcp
+          - -s
+          - "{{ pg_docker_bridge_cidr }}"
+          - -m
+          - conntrack
+          - --ctorigdstport
+          - "{{ pg_host_port }}"
+          - -m
+          - comment
+          - --comment
+          - "{{ pg_firewall_marker }}_allow_dockerbridge"
+          - -j
+          - ACCEPT
+      when:
+        - pg_docker_user_chain.rc == 0
+        - pg_allow_docker_bridge_access | bool
+      changed_when: true
+
+    - name: Allow configured public IPs to PostgreSQL
+      ansible.builtin.command:
+        argv:
+          - iptables
+          - -I
+          - DOCKER-USER
+          - "1"
+          - -p
+          - tcp
+          - -s
+          - "{{ item }}"
+          - -m
+          - conntrack
+          - --ctorigdstport
+          - "{{ pg_host_port }}"
+          - -m
+          - comment
+          - --comment
+          - "{{ pg_firewall_marker }}_allow_public_{{ item | replace('/', '_') }}"
+          - -j
+          - ACCEPT
+      loop: "{{ pg_public_allowed_list }}"
+      when:
+        - pg_docker_user_chain.rc == 0
+        - pg_public_allowed_list | length > 0
+      changed_when: true
+
+    - name: Allow configured private IPs to PostgreSQL
+      ansible.builtin.command:
+        argv:
+          - iptables
+          - -I
+          - DOCKER-USER
+          - "1"
+          - -p
+          - tcp
+          - -s
+          - "{{ item }}"
+          - -m
+          - conntrack
+          - --ctorigdstport
+          - "{{ pg_host_port }}"
+          - -m
+          - comment
+          - --comment
+          - "{{ pg_firewall_marker }}_allow_private_{{ item | replace('/', '_') }}"
+          - -j
+          - ACCEPT
+      loop: "{{ pg_private_allowed_list }}"
+      when:
+        - pg_docker_user_chain.rc == 0
+        - pg_private_allowed_list | length > 0
+      changed_when: true
+
+    - name: Persist PostgreSQL firewall rules
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+          netfilter-persistent save
+        elif [[ -d /etc/iptables ]]; then
+          iptables-save > /etc/iptables/rules.v4
+        else
+          echo "WARNING: iptables rules are active but no persistence mechanism was detected."
+        fi
+      args:
+        executable: /bin/bash
+      when: pg_docker_user_chain.rc == 0
+      changed_when: true
+
+    - name: Read PostgreSQL DOCKER-USER firewall rules
+      ansible.builtin.command:
+        argv:
+          - iptables
+          - -L
+          - DOCKER-USER
+          - -n
+          - --line-numbers
+      register: pg_firewall_rules
+      when: pg_docker_user_chain.rc == 0
+      changed_when: false
+
+    - name: Show PostgreSQL firewall rules
+      ansible.builtin.debug:
+        var: pg_firewall_rules.stdout_lines
+      when:
+        - pg_docker_user_chain.rc == 0
+        - pg_firewall_rules is defined
+
+    # ------------------------------------------------------------------
+    # Login verification
+    # ------------------------------------------------------------------
+
+    - name: Verify DB admin login
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ pg_admin_password }}"
+          - "{{ pg_container_name }}"
+          - psql
+          - -v
+          - ON_ERROR_STOP=1
+          - -U
+          - "{{ pg_admin_user }}"
+          - -d
+          - "{{ pg_default_database }}"
+          - -tAc
+          - SELECT 1;
+      register: pg_admin_login_check
+      changed_when: false
+      failed_when: pg_admin_login_check.stdout | trim != '1'
+      no_log: true
+
+    # ------------------------------------------------------------------
+    # postgres role hardening
+    # ------------------------------------------------------------------
+
+    - name: Check postgres role login state
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ pg_admin_password }}"
+          - "{{ pg_container_name }}"
+          - psql
+          - -v
+          - ON_ERROR_STOP=1
+          - -U
+          - "{{ pg_admin_user }}"
+          - -d
+          - "{{ pg_default_database }}"
+          - -tAc
+          - "SELECT rolcanlogin::int FROM pg_roles WHERE rolname='postgres';"
+      register: pg_postgres_login_state
+      changed_when: false
+      no_log: true
+
+    - name: Disable postgres login after successful verification
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ pg_admin_password }}"
+          - "{{ pg_container_name }}"
+          - psql
+          - -v
+          - ON_ERROR_STOP=1
+          - -U
+          - "{{ pg_admin_user }}"
+          - -d
+          - "{{ pg_default_database }}"
+          - -c
+          - ALTER ROLE postgres NOLOGIN;
+      when:
+        - pg_disable_postgres_login
+        - pg_postgres_login_state.stdout | trim == '1'
+      changed_when: true
+      no_log: true
+
+    - name: Verify postgres login state after hardening
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -e
+          - "PGPASSWORD={{ pg_admin_password }}"
+          - "{{ pg_container_name }}"
+          - psql
+          - -v
+          - ON_ERROR_STOP=1
+          - -U
+          - "{{ pg_admin_user }}"
+          - -d
+          - "{{ pg_default_database }}"
+          - -tAc
+          - "SELECT rolcanlogin::int FROM pg_roles WHERE rolname='postgres';"
+      register: pg_postgres_final_login_state
+      changed_when: false
+      failed_when: >-
+        pg_disable_postgres_login and
+        (pg_postgres_final_login_state.stdout | trim != '0')
+      no_log: true
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+
+    - name: Display PostgreSQL summary
+      ansible.builtin.debug:
+        msg:
+          - "PostgreSQL {{ pg_version }} / PostGIS / pgRouting deployed at {{ pg_dir }}."
+          - "Default PostgreSQL database={{ pg_default_database }}"
+          - "Published endpoint={{ pg_bind_ip }}:{{ pg_host_port }}"
+          - "Public remote allowlist={{ pg_public_allowed_list | join(', ') if pg_public_allowed_list | length > 0 else 'none' }}"
+          - "Private remote allowlist={{ pg_private_allowed_list | join(', ') if pg_private_allowed_list | length > 0 else 'none' }}"
+          - "If pg_bind_ip is 127.0.0.1, the published host port is local-only."

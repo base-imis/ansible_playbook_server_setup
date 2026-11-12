@@ -1,0 +1,458 @@
+---
+- name: Install and harden Nginx Proxy Manager
+  hosts: hardening_target
+  become: true
+  gather_facts: true
+
+  vars_prompt:
+    - name: npm_dir
+      prompt: "Nginx Proxy Manager install directory"
+      default: /home/innovative/nginx-proxy-manager
+      private: false
+
+    - name: npm_ssh_port
+      prompt: "SSH port used for the local admin tunnel"
+      default: "2224"
+      private: false
+
+    - name: npm_admin_user
+      prompt: "SSH username shown in tunnel instructions"
+      default: innovative
+      private: false
+
+    - name: npm_remove_existing_input
+      prompt: "Stop/remove the existing NPM container and rebuild the directory? (yes/no)"
+      default: "no"
+      private: false
+
+    - name: npm_manage_firewall_input
+      prompt: "Manage DOCKER-USER rules for NPM ports? (yes/no)"
+      default: "yes"
+      private: false
+
+    - name: npm_manage_audit_input
+      prompt: "Install lightweight NPM audit rules? (yes/no)"
+      default: "yes"
+      private: false
+
+  pre_tasks:
+    - name: Normalize NPM answers
+      ansible.builtin.set_fact:
+        npm_remove_existing: >-
+          {{ npm_remove_existing_input | trim | lower in ['yes', 'y', 'true', '1'] }}
+        npm_manage_firewall: >-
+          {{ npm_manage_firewall_input | trim | lower in ['yes', 'y', 'true', '1'] }}
+        npm_manage_audit: >-
+          {{ npm_manage_audit_input | trim | lower in ['yes', 'y', 'true', '1'] }}
+
+    - name: Validate NPM inputs
+      ansible.builtin.assert:
+        that:
+          - npm_dir.startswith('/')
+          - npm_dir not in ['/', '/opt', '/home', '/var', '/usr']
+          - npm_ssh_port | int >= 1
+          - npm_ssh_port | int <= 65535
+          - npm_admin_user | trim | length > 0
+          - npm_remove_existing_input | trim | lower in ['yes', 'y', 'true', '1', 'no', 'n', 'false', '0']
+          - npm_manage_firewall_input | trim | lower in ['yes', 'y', 'true', '1', 'no', 'n', 'false', '0']
+          - npm_manage_audit_input | trim | lower in ['yes', 'y', 'true', '1', 'no', 'n', 'false', '0']
+        fail_msg: "One or more Nginx Proxy Manager inputs are invalid."
+
+  tasks:
+    - name: Verify Docker command exists
+      ansible.builtin.command:
+        argv:
+          - docker
+          - --version
+      changed_when: false
+
+    - name: Verify Docker Compose plugin exists
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - version
+      changed_when: false
+
+    - name: Verify Docker daemon is running
+      ansible.builtin.command:
+        argv:
+          - docker
+          - info
+      changed_when: false
+
+    - name: Verify the tunnel administrator account exists
+      ansible.builtin.command:
+        argv:
+          - getent
+          - passwd
+          - "{{ npm_admin_user }}"
+      register: npm_admin_account
+      changed_when: false
+
+    - name: Inspect existing NPM container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - container
+          - inspect
+          - nginx-proxy-manager
+      register: npm_existing_container
+      changed_when: false
+      failed_when: false
+
+    - name: Read existing NPM health status
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "--format={{ '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' }}"
+          - nginx-proxy-manager
+      register: npm_existing_health
+      changed_when: false
+      failed_when: false
+      when: npm_existing_container.rc == 0
+
+    - name: Stop and remove existing NPM container when replacement was approved
+      ansible.builtin.command:
+        argv:
+          - docker
+          - rm
+          - -f
+          - nginx-proxy-manager
+      when:
+        - npm_remove_existing
+        - npm_existing_container.rc == 0
+      changed_when: true
+
+    - name: Remove existing NPM directory when replacement was approved
+      ansible.builtin.file:
+        path: "{{ npm_dir }}"
+        state: absent
+      when: npm_remove_existing
+
+    - name: Create base NPM directory
+      ansible.builtin.file:
+        path: "{{ npm_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create initial NPM bind-mount directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ npm_dir }}/data"
+        - "{{ npm_dir }}/letsencrypt"
+
+    - name: Write hardened NPM Compose file
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/03_npm_docker_compose.yml.j2"
+        dest: "{{ npm_dir }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      register: npm_compose_file
+
+    - name: Validate NPM Compose configuration
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - config
+      args:
+        chdir: "{{ npm_dir }}"
+      changed_when: false
+
+    - name: Pull NPM image
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - pull
+      args:
+        chdir: "{{ npm_dir }}"
+      register: npm_pull
+      changed_when: >-
+        'Downloaded newer image' in (npm_pull.stdout ~ npm_pull.stderr) or
+        'Pull complete' in (npm_pull.stdout ~ npm_pull.stderr) or
+        'Pulled' in (npm_pull.stdout ~ npm_pull.stderr)
+
+    - name: Read image used by the NPM Compose service
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - config
+          - --images
+      args:
+        chdir: "{{ npm_dir }}"
+      register: npm_compose_images
+      changed_when: false
+
+    - name: Validate that exactly one NPM image was resolved
+      ansible.builtin.assert:
+        that:
+          - npm_compose_images.stdout_lines | reject('equalto', '') | list | length >= 1
+        fail_msg: "Docker Compose did not resolve an image for Nginx Proxy Manager."
+
+    - name: Store the resolved NPM image
+      ansible.builtin.set_fact:
+        npm_resolved_image: >-
+          {{ (npm_compose_images.stdout_lines | reject('equalto', '') | list | first) | trim }}
+
+    - name: Apply writable ownership to NPM bind-mount directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+        recurse: true
+      loop:
+        - "{{ npm_dir }}/data"
+        - "{{ npm_dir }}/letsencrypt"
+
+    - name: Verify the NPM image can write to its data bind mount
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --volume
+          - "{{ npm_dir }}/data:/data"
+          - --entrypoint
+          - /bin/sh
+          - "{{ npm_resolved_image }}"
+          - -c
+          - "mkdir -p /data/.ansible-write-test && rmdir /data/.ansible-write-test"
+      changed_when: false
+
+    - name: Verify the NPM image can write to its certificate bind mount
+      ansible.builtin.command:
+        argv:
+          - docker
+          - run
+          - --rm
+          - --volume
+          - "{{ npm_dir }}/letsencrypt:/etc/letsencrypt"
+          - --entrypoint
+          - /bin/sh
+          - "{{ npm_resolved_image }}"
+          - -c
+          - "mkdir -p /etc/letsencrypt/.ansible-write-test && rmdir /etc/letsencrypt/.ansible-write-test"
+      changed_when: false
+
+    - name: Decide whether NPM must be recreated
+      ansible.builtin.set_fact:
+        npm_force_recreate: >-
+          {{
+            npm_compose_file.changed
+            or npm_existing_container.rc != 0
+            or (
+              npm_existing_health is defined
+              and npm_existing_health.stdout | default('none') | trim != 'healthy'
+            )
+          }}
+
+    - name: Recreate NPM when configuration changed or the container is unhealthy
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - up
+          - -d
+          - --remove-orphans
+          - --force-recreate
+      args:
+        chdir: "{{ npm_dir }}"
+      register: npm_up_recreated
+      changed_when: true
+      when: npm_force_recreate
+
+    - name: Start or update NPM without unnecessary recreation
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - up
+          - -d
+          - --remove-orphans
+      args:
+        chdir: "{{ npm_dir }}"
+      register: npm_up_normal
+      changed_when: >-
+        'Started' in (npm_up_normal.stdout ~ npm_up_normal.stderr) or
+        'Created' in (npm_up_normal.stdout ~ npm_up_normal.stderr) or
+        'Recreated' in (npm_up_normal.stdout ~ npm_up_normal.stderr) or
+        'Creating' in (npm_up_normal.stdout ~ npm_up_normal.stderr)
+      when: not npm_force_recreate
+
+    - name: Wait for NPM health and API
+      block:
+        - name: Wait for the built-in NPM health check
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - nginx-proxy-manager
+              - /usr/bin/check-health
+          register: npm_builtin_health
+          changed_when: false
+          retries: 24
+          delay: 5
+          until: npm_builtin_health.rc == 0
+
+        - name: Wait for NPM admin API
+          ansible.builtin.uri:
+            url: http://127.0.0.1:81/api/
+            status_code: [200, 401, 404]
+            return_content: false
+          register: npm_health
+          retries: 12
+          delay: 5
+          until: npm_health.status in [200, 401, 404]
+
+      rescue:
+        - name: Collect NPM container status after health failure
+          ansible.builtin.command:
+            argv:
+              - docker
+              - ps
+              - -a
+              - --filter
+              - name=nginx-proxy-manager
+          register: npm_failed_status
+          changed_when: false
+          failed_when: false
+
+        - name: Collect NPM logs after health failure
+          ansible.builtin.command:
+            argv:
+              - docker
+              - logs
+              - --tail
+              - "200"
+              - nginx-proxy-manager
+          register: npm_failed_logs
+          changed_when: false
+          failed_when: false
+
+        - name: Display NPM failure diagnostics
+          ansible.builtin.debug:
+            msg:
+              - "Container status:"
+              - "{{ npm_failed_status.stdout | default('Unavailable') }}"
+              - "Recent container logs:"
+              - "{{ npm_failed_logs.stdout | default('Unavailable') }}"
+              - "{{ npm_failed_logs.stderr | default('') }}"
+
+        - name: Stop because NPM did not become healthy
+          ansible.builtin.fail:
+            msg: >-
+              Nginx Proxy Manager did not become healthy. Review the container
+              status and logs displayed above. The bind-mounted directories are
+              {{ npm_dir }}/data and {{ npm_dir }}/letsencrypt.
+
+    - name: Check DOCKER-USER chain
+      ansible.builtin.command:
+        argv:
+          - iptables
+          - -L
+          - DOCKER-USER
+          - -n
+      register: npm_docker_user_chain
+      changed_when: false
+      failed_when: false
+      when: npm_manage_firewall
+
+    - name: Install idempotent NPM DOCKER-USER rules
+      ansible.builtin.shell: |
+        set -euo pipefail
+
+        while iptables -S DOCKER-USER 2>/dev/null | grep -q -- '--dport 81'; do
+          rule="$(iptables -S DOCKER-USER | grep -- '--dport 81' | head -1 | sed 's/^-A DOCKER-USER /-D DOCKER-USER /')"
+          iptables ${rule} || break
+        done
+
+        iptables -I DOCKER-USER 1 -p tcp --dport 81 -s 127.0.0.1 -j ACCEPT
+        iptables -I DOCKER-USER 2 -p tcp --dport 81 -j DROP
+
+        iptables -C DOCKER-USER -p tcp --dport 80 -j ACCEPT 2>/dev/null || \
+          iptables -A DOCKER-USER -p tcp --dport 80 -j ACCEPT
+
+        iptables -C DOCKER-USER -p tcp --dport 443 -j ACCEPT 2>/dev/null || \
+          iptables -A DOCKER-USER -p tcp --dport 443 -j ACCEPT
+
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+          netfilter-persistent save
+        fi
+      args:
+        executable: /bin/bash
+      when:
+        - npm_manage_firewall
+        - npm_docker_user_chain.rc == 0
+      changed_when: true
+
+    - name: Write NPM audit rules
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/03_npm_audit.rules.j2"
+        dest: /etc/audit/rules.d/npm.rules
+        owner: root
+        group: root
+        mode: "0640"
+      notify: Reload NPM audit rules
+      when: npm_manage_audit
+
+    - name: Write NPM notes
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../templates/03_npm_notes.md.j2"
+        dest: "{{ npm_dir }}/NOTES.md"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Verify NPM container is running
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "--format={{ '{{.State.Running}}' }}"
+          - nginx-proxy-manager
+      register: npm_running
+      changed_when: false
+      failed_when: npm_running.stdout | trim != 'true'
+
+    - name: Verify NPM container is healthy
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - "--format={{ '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' }}"
+          - nginx-proxy-manager
+      register: npm_final_health
+      changed_when: false
+      failed_when: npm_final_health.stdout | trim != 'healthy'
+
+    - name: Display NPM access information
+      ansible.builtin.debug:
+        msg:
+          - "NPM is listening publicly on ports 80 and 443."
+          - "The admin interface is bound to 127.0.0.1 on port 81."
+          - "Tunnel: ssh -p {{ npm_ssh_port }} -N -L 8181:127.0.0.1:81 {{ npm_admin_user }}@{{ ansible_host }}"
+          - "Open http://127.0.0.1:8181 and immediately change the initial administrator credentials."
+
+  handlers:
+    - name: Reload NPM audit rules
+      ansible.builtin.command:
+        argv:
+          - augenrules
+          - --load
+      changed_when: true
+      failed_when: false

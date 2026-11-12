@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+POSTGRES_SUPER_PASSWORD="$(cat /run/pg-secrets/{{ pg_secret_postgres }}.txt)"
+DB_ADMIN_PASSWORD="$(cat /run/pg-secrets/{{ pg_secret_admin }}.txt)"
+
+export PGPASSWORD="$POSTGRES_SUPER_PASSWORD"
+
+sql_quote_literal() {
+  printf "%s" "$1" | sed "s/'/''/g"
+}
+
+ADMIN_PASSWORD_SQL="$(sql_quote_literal "$DB_ADMIN_PASSWORD")"
+
+role_exists() {
+  psql \
+    -v ON_ERROR_STOP=1 \
+    --username "$POSTGRES_USER" \
+    --dbname "$POSTGRES_DB" \
+    -tAc "SELECT 1 FROM pg_roles WHERE rolname='$1'" |
+    grep -q 1
+}
+
+if ! role_exists "{{ pg_admin_user }}"; then
+  psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+    -c "CREATE ROLE \"{{ pg_admin_user }}\" WITH LOGIN SUPERUSER CREATEDB CREATEROLE PASSWORD '${ADMIN_PASSWORD_SQL}';"
+else
+  psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+    -c "ALTER ROLE \"{{ pg_admin_user }}\" WITH LOGIN SUPERUSER CREATEDB CREATEROLE PASSWORD '${ADMIN_PASSWORD_SQL}';"
+fi
+
+# Enable the spatial and routing extensions in the default database created
+# by the PostgreSQL container. Application databases created later by
+# 051_postgres_helper.yml enable the same extensions separately.
+psql -v ON_ERROR_STOP=1 \
+  --username "$POSTGRES_USER" \
+  --dbname "$POSTGRES_DB" \
+  -c "CREATE EXTENSION IF NOT EXISTS postgis;" \
+  -c "CREATE EXTENSION IF NOT EXISTS postgis_topology;" \
+  -c "CREATE EXTENSION IF NOT EXISTS pgrouting;"

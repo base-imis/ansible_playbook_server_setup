@@ -1,0 +1,569 @@
+---
+- name: Install and harden Docker Engine and Compose
+  hosts: hardening_target
+  become: true
+  gather_facts: true
+
+  vars_prompt:
+    - name: docker_configure_auditd_input
+      prompt: "Install Docker audit rules? (yes/no)"
+      default: "yes"
+      private: false
+
+    - name: docker_restart_after_change_input
+      prompt: "Restart Docker automatically when its configuration changes? (yes/no)"
+      default: "yes"
+      private: false
+
+    - name: docker_pause_after_sections_input
+      prompt: "Pause after each major section for manual testing? (yes/no)"
+      default: "yes"
+      private: false
+
+    - name: docker_log_max_size
+      prompt: "Maximum size of each Docker JSON log file"
+      default: "50m"
+      private: false
+
+    - name: docker_log_max_file
+      prompt: "Maximum number of Docker JSON log files"
+      default: "5"
+      private: false
+
+  vars:
+    docker_prerequisite_packages:
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+      - apt-transport-https
+      - auditd
+      - audispd-plugins
+      - jq
+      - iptables
+
+    docker_engine_packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+
+    docker_keyring_directory: /etc/apt/keyrings
+    docker_ascii_key_file: /etc/apt/keyrings/docker.asc
+    docker_gpg_key_file: /etc/apt/keyrings/docker.gpg
+    docker_repository_file: /etc/apt/sources.list.d/docker.list
+    docker_daemon_directory: /etc/docker
+    docker_daemon_file: /etc/docker/daemon.json
+    docker_daemon_candidate_file: /etc/docker/daemon.json.ansible-candidate
+    docker_audit_rules_file: /etc/audit/rules.d/docker.rules
+
+  pre_tasks:
+    - name: Normalize operator answers
+      ansible.builtin.set_fact:
+        docker_configure_auditd: >-
+          {{ docker_configure_auditd_input | trim | lower
+             in ['yes', 'y', 'true', '1'] }}
+        docker_restart_after_change: >-
+          {{ docker_restart_after_change_input | trim | lower
+             in ['yes', 'y', 'true', '1'] }}
+        docker_pause_after_sections: >-
+          {{ docker_pause_after_sections_input | trim | lower
+             in ['yes', 'y', 'true', '1'] }}
+
+    - name: Validate operator-provided values
+      ansible.builtin.assert:
+        that:
+          - docker_configure_auditd_input | trim | lower in valid_boolean_answers
+          - docker_restart_after_change_input | trim | lower in valid_boolean_answers
+          - docker_pause_after_sections_input | trim | lower in valid_boolean_answers
+          - docker_log_max_size is match('^[1-9][0-9]*[kKmMgG]$')
+          - docker_log_max_file | int > 0
+        fail_msg: >-
+          Enter yes/no for confirmation questions, a log size such as 50m,
+          and a positive number for the maximum log-file count.
+      vars:
+        valid_boolean_answers:
+          - "yes"
+          - "y"
+          - "true"
+          - "1"
+          - "no"
+          - "n"
+          - "false"
+          - "0"
+
+    - name: Verify the managed operating system is supported
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution in ['Ubuntu', 'Debian']
+          - >-
+            (ansible_distribution == 'Ubuntu' and
+             ansible_distribution_version is version('22.04', '>=')) or
+            (ansible_distribution == 'Debian' and
+             ansible_distribution_major_version | int >= 12)
+        fail_msg: >-
+          This playbook supports Ubuntu 22.04 or newer and Debian 12 or newer.
+        success_msg: "Supported operating system detected."
+
+    - name: Set Docker repository operating-system name
+      ansible.builtin.set_fact:
+        docker_repository_os: >-
+          {{ 'ubuntu' if ansible_distribution == 'Ubuntu' else 'debian' }}
+        docker_repository_codename: "{{ ansible_distribution_release }}"
+
+  tasks:
+    # STEP 1 - Install prerequisite packages.
+    - name: Install Docker prerequisite packages
+      ansible.builtin.apt:
+        name: "{{ docker_prerequisite_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Pause after prerequisite installation
+      ansible.builtin.pause:
+        prompt: >-
+          Prerequisites are installed. Press ENTER to continue, or type
+          'stop' to end the play safely.
+      register: docker_pause_step_1
+      when: docker_pause_after_sections | bool
+
+    - name: Stop safely after prerequisite installation
+      ansible.builtin.meta: end_play
+      when:
+        - docker_pause_after_sections | bool
+        - docker_pause_step_1.user_input | default('') | trim | lower == 'stop'
+
+    # STEP 2 - Add the official Docker apt repository.
+    - name: Ensure Docker apt keyring directory exists
+      ansible.builtin.file:
+        path: "{{ docker_keyring_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download the official Docker signing key
+      ansible.builtin.get_url:
+        url: "https://download.docker.com/linux/{{ docker_repository_os }}/gpg"
+        dest: "{{ docker_ascii_key_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        timeout: 30
+      register: docker_ascii_key_download
+
+    - name: Check whether the dearmored Docker key exists
+      ansible.builtin.stat:
+        path: "{{ docker_gpg_key_file }}"
+      register: docker_gpg_key_status
+
+    - name: Validate the existing dearmored Docker signing key
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --show-keys
+          - --with-colons
+          - "{{ docker_gpg_key_file }}"
+      register: docker_existing_key_validation
+      changed_when: false
+      failed_when: false
+      when: docker_gpg_key_status.stat.exists
+
+    - name: Dearmor the Docker signing key
+      ansible.builtin.command:
+        argv:
+          - gpg
+          - --dearmor
+          - --yes
+          - --output
+          - "{{ docker_gpg_key_file }}"
+          - "{{ docker_ascii_key_file }}"
+      when: >-
+        docker_ascii_key_download.changed or
+        not docker_gpg_key_status.stat.exists or
+        docker_existing_key_validation.rc | default(1) != 0
+      register: docker_key_dearmor
+      changed_when: docker_key_dearmor.rc == 0
+
+    - name: Set Docker signing-key permissions
+      ansible.builtin.file:
+        path: "{{ docker_gpg_key_file }}"
+        state: file
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Read the system package architecture
+      ansible.builtin.command:
+        argv:
+          - dpkg
+          - --print-architecture
+      register: docker_dpkg_architecture
+      changed_when: false
+
+    - name: Configure the official Docker apt repository
+      ansible.builtin.copy:
+        dest: "{{ docker_repository_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+        content: >
+          deb [arch={{ docker_dpkg_architecture.stdout | trim }}
+          signed-by={{ docker_gpg_key_file }}]
+          https://download.docker.com/linux/{{ docker_repository_os }}
+          {{ docker_repository_codename }} stable
+      register: docker_repository_configuration
+
+    - name: Refresh apt metadata after Docker repository changes
+      ansible.builtin.apt:
+        update_cache: true
+      when: >-
+        docker_repository_configuration.changed or
+        docker_ascii_key_download.changed or
+        docker_key_dearmor.changed | default(false)
+
+    - name: Pause after Docker repository configuration
+      ansible.builtin.pause:
+        prompt: >-
+          Docker repository is configured. Press ENTER to continue, or type
+          'stop' to end the play safely.
+      register: docker_pause_step_2
+      when: docker_pause_after_sections | bool
+
+    - name: Stop safely after Docker repository configuration
+      ansible.builtin.meta: end_play
+      when:
+        - docker_pause_after_sections | bool
+        - docker_pause_step_2.user_input | default('') | trim | lower == 'stop'
+
+    # STEP 3 - Install Docker Engine and Compose.
+    - name: Install Docker Engine and Compose plugin
+      ansible.builtin.apt:
+        name: "{{ docker_engine_packages }}"
+        state: present
+        update_cache: false
+
+    - name: Enable and start containerd
+      ansible.builtin.systemd_service:
+        name: containerd
+        enabled: true
+        state: started
+
+    - name: Enable and start Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Verify Docker CLI is installed
+      ansible.builtin.command:
+        argv:
+          - docker
+          - --version
+      register: docker_version_result
+      changed_when: false
+
+    - name: Verify Docker Compose plugin is installed
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - version
+      register: docker_compose_version_result
+      changed_when: false
+
+    - name: Pause after Docker installation
+      ansible.builtin.pause:
+        prompt: >-
+          Docker Engine and Compose are installed. Press ENTER to continue,
+          or type 'stop' to end the play safely.
+      register: docker_pause_step_3
+      when: docker_pause_after_sections | bool
+
+    - name: Stop safely after Docker installation
+      ansible.builtin.meta: end_play
+      when:
+        - docker_pause_after_sections | bool
+        - docker_pause_step_3.user_input | default('') | trim | lower == 'stop'
+
+    # STEP 4 - Build, validate, and install daemon.json.
+    - name: Ensure Docker configuration directory exists
+      ansible.builtin.file:
+        path: "{{ docker_daemon_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check whether Docker daemon configuration exists
+      ansible.builtin.stat:
+        path: "{{ docker_daemon_file }}"
+      register: docker_daemon_file_status
+
+    - name: Read existing Docker daemon configuration
+      ansible.builtin.slurp:
+        src: "{{ docker_daemon_file }}"
+      register: docker_existing_daemon_file
+      when: docker_daemon_file_status.stat.exists
+
+    - name: Parse existing Docker daemon configuration
+      ansible.builtin.set_fact:
+        docker_existing_daemon_config: >-
+          {{
+            (docker_existing_daemon_file.content | b64decode | from_json)
+            if docker_daemon_file_status.stat.exists
+            else {}
+          }}
+
+    - name: Remove userns-remap from existing Docker configuration
+      ansible.builtin.set_fact:
+        docker_existing_daemon_config_for_merge: >-
+          {{
+            docker_existing_daemon_config
+            | dict2items
+            | rejectattr('key', 'equalto', 'userns-remap')
+            | list
+            | items2dict
+          }}
+
+    - name: Build hardened Docker daemon settings
+      ansible.builtin.set_fact:
+        docker_hardened_daemon_config: >-
+          {{
+            {
+              'no-new-privileges': true,
+              'live-restore': true,
+              'icc': false,
+              'iptables': true,
+              'log-driver': 'json-file',
+              'log-opts': {
+                'max-size': docker_log_max_size,
+                'max-file': docker_log_max_file | string
+              },
+              'default-ulimits': {
+                'nofile': {
+                  'Name': 'nofile',
+                  'Hard': 64000,
+                  'Soft': 64000
+                }
+              }
+            }
+          }}
+
+    - name: Merge existing and hardened Docker settings
+      ansible.builtin.set_fact:
+        docker_merged_daemon_config: >-
+          {{
+            docker_existing_daemon_config_for_merge
+            | combine(docker_hardened_daemon_config, recursive=True)
+          }}
+
+    - name: Determine whether Docker daemon configuration must change
+      ansible.builtin.set_fact:
+        docker_daemon_change_required: >-
+          {{
+            not docker_daemon_file_status.stat.exists or
+            docker_existing_daemon_config != docker_merged_daemon_config
+          }}
+
+    - name: Write candidate Docker daemon configuration
+      ansible.builtin.copy:
+        dest: "{{ docker_daemon_candidate_file }}"
+        content: "{{ docker_merged_daemon_config | to_nice_json }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+      when: docker_daemon_change_required | bool
+
+    - name: Validate candidate daemon configuration as JSON
+      ansible.builtin.command:
+        argv:
+          - jq
+          - empty
+          - "{{ docker_daemon_candidate_file }}"
+      changed_when: false
+      when: docker_daemon_change_required | bool
+
+    - name: Validate candidate configuration with dockerd
+      ansible.builtin.command:
+        argv:
+          - dockerd
+          - --validate
+          - --config-file
+          - "{{ docker_daemon_candidate_file }}"
+      changed_when: false
+      when: docker_daemon_change_required | bool
+
+    - name: Install hardened Docker daemon configuration
+      ansible.builtin.copy:
+        src: "{{ docker_daemon_candidate_file }}"
+        dest: "{{ docker_daemon_file }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+      when: docker_daemon_change_required | bool
+      register: docker_daemon_install
+
+    - name: Remove candidate Docker daemon configuration
+      ansible.builtin.file:
+        path: "{{ docker_daemon_candidate_file }}"
+        state: absent
+      when: docker_daemon_change_required | bool
+
+    - name: Pause after Docker daemon configuration
+      ansible.builtin.pause:
+        prompt: >-
+          daemon.json is prepared and validated. Press ENTER to continue,
+          or type 'stop' to end the play safely.
+      register: docker_pause_step_4
+      when: docker_pause_after_sections | bool
+
+    - name: Stop safely after Docker daemon configuration
+      ansible.builtin.meta: end_play
+      when:
+        - docker_pause_after_sections | bool
+        - docker_pause_step_4.user_input | default('') | trim | lower == 'stop'
+
+    # STEP 5 - Install Docker audit rules.
+    - name: Ensure audit rules directory exists
+      ansible.builtin.file:
+        path: /etc/audit/rules.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      when: docker_configure_auditd | bool
+
+    - name: Install Docker audit rules
+      ansible.builtin.copy:
+        dest: "{{ docker_audit_rules_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+        backup: true
+        content: |
+          # Docker daemon and client binaries
+          -w /usr/bin/docker                                -p x -k docker
+          -w /usr/bin/dockerd                               -p x -k docker
+
+          # Docker data and configuration
+          -w /etc/docker                                    -p wa -k docker-config
+          -w /usr/lib/systemd/system/docker.service         -p wa -k docker-service
+          -w /var/run/docker.sock                           -p rwxa -k docker-socket
+
+          # Intentionally excluded:
+          # -w /var/lib/docker -k docker
+          # Reason: watching /var/lib/docker can create heavy audit and I/O
+          # overhead on busy production container hosts.
+      when: docker_configure_auditd | bool
+      register: docker_audit_rules_install
+
+    - name: Pause after Docker audit-rule configuration
+      ansible.builtin.pause:
+        prompt: >-
+          Docker audit rules are configured. Press ENTER to continue, or type
+          'stop' to end the play safely.
+      register: docker_pause_step_5
+      when:
+        - docker_pause_after_sections | bool
+        - docker_configure_auditd | bool
+
+    - name: Stop safely after Docker audit-rule configuration
+      ansible.builtin.meta: end_play
+      when:
+        - docker_pause_after_sections | bool
+        - docker_configure_auditd | bool
+        - docker_pause_step_5.user_input | default('') | trim | lower == 'stop'
+
+    # STEP 6 - Apply deferred handlers and verify the result.
+    - name: Queue Docker restart after all checkpoints pass
+      ansible.builtin.debug:
+        msg: "Docker configuration changed; a restart is queued."
+      changed_when: true
+      when:
+        - docker_daemon_install.changed | default(false)
+        - docker_restart_after_change | bool
+      notify: Restart Docker
+
+    - name: Queue Docker audit-rule reload after all checkpoints pass
+      ansible.builtin.debug:
+        msg: "Docker audit rules changed; an audit reload is queued."
+      changed_when: true
+      when:
+        - docker_audit_rules_install.changed | default(false)
+        - docker_configure_auditd | bool
+      notify: Reload Docker audit rules
+
+    - name: Apply pending Docker and audit changes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Warn when a changed Docker configuration was not restarted
+      ansible.builtin.debug:
+        msg: >-
+          daemon.json changed, but Docker was not restarted because the
+          operator selected no. Restart Docker before relying on the new
+          settings.
+      when:
+        - docker_daemon_change_required | bool
+        - not docker_restart_after_change | bool
+
+    - name: Verify Docker service is active
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - docker
+      register: docker_active_result
+      changed_when: false
+
+    - name: Verify Docker service is enabled
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-enabled
+          - docker
+      register: docker_enabled_result
+      changed_when: false
+
+    - name: Verify effective Docker information
+      ansible.builtin.command:
+        argv:
+          - docker
+          - info
+      register: docker_info_result
+      changed_when: false
+
+    - name: Show Docker hardening result
+      ansible.builtin.debug:
+        msg:
+          - "Docker: {{ docker_version_result.stdout }}"
+          - "Compose: {{ docker_compose_version_result.stdout }}"
+          - "Docker service state: {{ docker_active_result.stdout }}"
+          - "Docker enabled state: {{ docker_enabled_result.stdout }}"
+          - "Audit rules requested: {{ docker_configure_auditd }}"
+          - >-
+            Log rotation: {{ docker_log_max_size }} x
+            {{ docker_log_max_file }} files
+          - >-
+            Users may need to log out and back in if Docker group membership
+            is managed separately.
+
+  handlers:
+    - name: Restart Docker
+      ansible.builtin.systemd_service:
+        name: docker
+        state: restarted
+      when: docker_restart_after_change | bool
+
+    - name: Reload Docker audit rules
+      ansible.builtin.command:
+        argv:
+          - augenrules
+          - --load
+      changed_when: true
+      when: docker_configure_auditd | bool

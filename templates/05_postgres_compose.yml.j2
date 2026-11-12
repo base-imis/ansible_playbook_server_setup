@@ -1,0 +1,40 @@
+services:
+  {{ pg_container_name }}:
+    image: {{ pg_postgis_image }}
+    container_name: {{ pg_container_name }}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: {{ pg_default_database }}
+      POSTGRES_PASSWORD_FILE: /run/pg-secrets/{{ pg_secret_postgres }}.txt
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    ports:
+      - "{{ pg_bind_ip }}:{{ pg_host_port }}:5432"
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./backups:/backups
+      - ./logs:/var/log/postgresql
+      - ./conf/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./conf/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - ./secrets:/run/pg-secrets:ro
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    networks:
+      - {{ pg_network_name }}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -d {{ pg_default_database }}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  {{ pg_network_name }}:
+    name: {{ pg_network_name }}
+    driver: bridge

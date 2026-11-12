@@ -1,0 +1,3 @@
+# NPM audit rules - managed by Ansible
+-w {{ npm_dir }}/docker-compose.yml -p wa -k npm-compose
+-w {{ npm_dir }}/letsencrypt -p wa -k npm-certs

@@ -1,0 +1,6 @@
+.ansible/
+*.retry
+*.log
+*.vault
+inventory.ini
+inventories/runtime.ini
