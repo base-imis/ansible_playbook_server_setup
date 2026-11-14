@@ -116,6 +116,10 @@
       prompt: "GeoServer workspace name; ignored when GeoServer is disabled"
       private: false
       default: "{{ vault_laravel_geoserver_workspace | default('workspace') }}"
+    - name: laravel_geoserver_internal_url_input
+      prompt: "GeoServer internal URL (optional; press Enter to use the Docker URL)"
+      private: false
+      default: "{{ vault_laravel_geoserver_internal_url | default('') }}"
     - name: laravel_geoserver_auth_key
       prompt: "GeoServer AuthKey secret (optional; press Enter to skip)"
       private: true
@@ -223,7 +227,10 @@
     laravel_geoserver_network: "{{ vault_laravel_geoserver_network | default('geoserver_proxy') }}"
     laravel_geoserver_host: "{{ vault_laravel_geoserver_host | default('geo') }}"
     laravel_geoserver_url: "http://{{ laravel_geoserver_host }}:8080/geoserver/"
-    laravel_geoserver_internal_url: "{{ laravel_geoserver_url }}{{ laravel_geoserver_workspace }}/"
+    laravel_geoserver_internal_url: >-
+      {{ (laravel_geoserver_internal_url_input | trim)
+         if (laravel_geoserver_internal_url_input | default('') | trim | length > 0)
+         else (laravel_geoserver_url ~ laravel_geoserver_workspace ~ '/') }}
     laravel_mapfish_print_url: "{{ laravel_geoserver_url }}pdf/print.pdf"
     laravel_php_container: "php-{{ laravel_project_name }}"
     laravel_shared_nginx_dir: "{{ laravel_base_path }}/shared-nginx"
@@ -959,6 +966,20 @@
         regexp: "^open_basedir\\s*="
         line: "open_basedir = /var/www/html:/run/secrets:/tmp:/var/log/php"
         create: false
+      when: laravel_pii_setup
+
+    - name: Enable proc_open for Laravel PII tests
+      ansible.builtin.replace:
+        path: "{{ laravel_project_dir }}/dockerfiles/php/php.ini"
+        regexp: "^(\\s*disable_functions\\s*=.*),\\s*proc_open,\\s*"
+        replace: "\\1,"
+      when: laravel_pii_setup
+
+    - name: Remove trailing proc_open from PHP disabled functions
+      ansible.builtin.replace:
+        path: "{{ laravel_project_dir }}/dockerfiles/php/php.ini"
+        regexp: "^(\\s*disable_functions\\s*=.*),\\s*proc_open\\s*$"
+        replace: "\\1"
       when: laravel_pii_setup
 
     - name: Replace old IMIS application paths in active Docker template files
@@ -3921,6 +3942,35 @@
       changed_when: true
       when: laravel_pii_setup
 
+    - name: Refresh Composer autoload before PII seeders
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ laravel_compose_file }}"
+          - -f
+          - "{{ laravel_tools_override_file }}"
+          - run
+          - --rm
+          - --no-deps
+          - -T
+          - -v
+          - "{{ laravel_webapp_dir }}:/app"
+          - -w
+          - /app
+          - "{{ laravel_composer_service }}"
+          - dump-autoload
+          - --optimize
+          - --no-interaction
+      args:
+        chdir: "{{ laravel_project_dir }}"
+      register: laravel_pii_composer_autoload
+      changed_when: true
+      when:
+        - laravel_pii_setup
+        - laravel_composer_json.stat.exists
+
     - name: Seed PII owner permissions
       ansible.builtin.command:
         argv:
@@ -3932,7 +3982,7 @@
           - php
           - "{{ laravel_container_app_dir }}/artisan"
           - db:seed
-          - --class=Database\\Seeders\\OwnerPiiPermissionsSeeder
+          - --class=OwnerPiiPermissionsSeeder
           - --force
       changed_when: true
       when: laravel_pii_setup
@@ -3948,7 +3998,7 @@
           - php
           - "{{ laravel_container_app_dir }}/artisan"
           - db:seed
-          - --class=Database\\Seeders\\ApplicationPiiPermissionsSeeder
+          - --class=ApplicationPiiPermissionsSeeder
           - --force
       changed_when: true
       when: laravel_pii_setup
@@ -3964,7 +4014,7 @@
           - php
           - "{{ laravel_container_app_dir }}/artisan"
           - db:seed
-          - --class=Database\\Seeders\\PropertyTaxPiiPermissionsSeeder
+          - --class=PropertyTaxPiiPermissionsSeeder
           - --force
       changed_when: true
       when: laravel_pii_setup
@@ -4254,7 +4304,7 @@
       changed_when: false
       when: laravel_pii_backfill
 
-    - name: Run the PII test suite
+    - name: Verify proc_open is available for the PII test suite
       ansible.builtin.command:
         argv:
           - docker
@@ -4263,7 +4313,25 @@
           - /
           - "{{ laravel_php_container }}"
           - php
-          - "{{ laravel_container_app_dir }}/artisan"
+          - -r
+          - >-
+            if (!function_exists('proc_open')) {
+            fwrite(STDERR, 'proc_open is disabled in PHP; rebuild the PHP image with the PII php.ini.');
+            exit(1);
+            }
+      changed_when: false
+      when: laravel_pii_backfill
+
+    - name: Run the PII test suite
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - -w
+          - "{{ laravel_container_app_dir }}"
+          - "{{ laravel_php_container }}"
+          - php
+          - artisan
           - test
           - --filter=Pii
       register: laravel_pii_tests

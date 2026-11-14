@@ -46,8 +46,8 @@
     - name: Set the initial SSH port prompt default
       ansible.builtin.set_fact:
         hardening_initial_port_hint: >-
-          {{ (41447 if hardening_local_connection
-              else (ansible_port | default(41447, true))) | int }}
+          {{ (2224 if hardening_local_connection
+              else (ansible_port | default(2224, true))) | int }}
       delegate_to: localhost
       become: false
 
