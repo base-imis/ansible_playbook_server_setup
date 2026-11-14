@@ -3710,7 +3710,7 @@
                   "@key": "JDBC_VIRTUAL_TABLE",
                   "virtualTable": {
                     "name": "buildings_tax_status_layer",
-                    "sql": "SELECT \r\n    t.tax_code,\r\n\tb.bin,\r\n\tt.ward,\r\n\tt.building_associated_to,\r\n\tt.owner_name,\r\n\tt.owner_contact,\r\n\tt.last_payment_date,\r\n\td.name as due_year,\r\n        b.geom,\r\n    t.deleted_at      \r\nFROM \r\n    building_info.buildings b\r\nLEFT JOIN \r\n    taxpayment_info.tax_payment_status t\r\nON \r\n    b.tax_code = t.tax_code \r\nLEFT JOIN \r\n    taxpayment_info.due_years d\r\nON \r\n    d.value = t.due_year\n",
+                    "sql": "SELECT \r\n    t.tax_code,\r\n    b.bin,\r\n    t.ward,\r\n    t.building_associated_to,\r\n    tp.owner_name,\r\n    tp.owner_contact,\r\n    t.last_payment_date,\r\n    d.name AS due_year,\r\n    b.geom,\r\n    t.deleted_at\r\nFROM building_info.buildings b\r\nLEFT JOIN taxpayment_info.tax_payment_status t\r\n    ON b.tax_code = t.tax_code\r\nLEFT JOIN taxpayment_info.tax_payments tp\r\n    ON b.tax_code = tp.tax_code\r\nLEFT JOIN taxpayment_info.due_years d\r\n    ON d.value = t.due_year\r\nWHERE t.tax_code IS NOT NULL\r\n  AND t.tax_code <> ''\r\n",
                     "escapeSql": false,
                     "geometry": {
                       "name": "geom",
