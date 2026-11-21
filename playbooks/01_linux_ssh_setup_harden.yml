@@ -1519,7 +1519,7 @@
                if hardening_local_connection
                else 'inventory.ini was updated to the final administrative user, port, and same key.' }}
           - "The custom firewall protects host INPUT without flushing Docker FORWARD chains."
-          - "firewall rules are configured
+          - "firewall rules are ."
 
 
   handlers:
